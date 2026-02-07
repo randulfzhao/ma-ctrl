@@ -1,0 +1,4 @@
+/logs
+/wandb
+.vscode
+__pycache__

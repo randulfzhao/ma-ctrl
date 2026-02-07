@@ -1,0 +1,6 @@
+pettingzoo[mpe]
+gymnasium
+mujoco
+numpy
+gymnasium-robotics
+wandb

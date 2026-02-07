@@ -44,6 +44,18 @@ class BaseEnv(gym.Env, metaclass=ABCMeta):
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Gym stores a RandomNumberGenerator wrapper that is not deepcopy-safe.
+        state.pop('np_random', None)
+        state.pop('_np_random', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if '_np_random' not in self.__dict__:
+            self.seed()
     
     @property
     def device(self):

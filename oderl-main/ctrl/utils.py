@@ -154,10 +154,12 @@ def plot_sequences(ctrl, fname, tobs, st, at, rt, t, st_hat, at_hat, rt_hat, ver
     act_hats = act_hats.cpu().detach().numpy() # T
     if verbose: 
         print(f'average error is {err}')
-    w = ctrl.env.n + ctrl.env.m + 2
-    plt.figure(1,((ctrl.env.n+ctrl.env.m)*5,N*3))
+    n_plot = min(ctrl.env.n, 10)
+    m_plot = min(ctrl.env.m, 5)
+    w = n_plot + m_plot + 2
+    plt.figure(1,((n_plot+m_plot)*5,N*3))
     for j in range(N):
-        for i in range(ctrl.env.n):
+        for i in range(n_plot):
             plt.subplot(N,w,j*w+i+1)
             plt.plot(t[j], st_hat[:,j,:,i].T, '-b',linewidth=.75)
             if i==0:
@@ -167,22 +169,22 @@ def plot_sequences(ctrl, fname, tobs, st, at, rt, t, st_hat, at_hat, rt_hat, ver
                 plt.title(ctrl.env.state_actions_names[i],fontsize=25)    
             # rang = (st[j,:,i].max() - st[j,:,i].min()).item()
             # plt.ylim([st[j,:,i].min().item()-rang/5, st[j,:,i].max().item()+rang/5])
-        for i in range(ctrl.env.m):
-            plt.subplot(N,w,j*w+ctrl.env.n+i+1)
+        for i in range(m_plot):
+            plt.subplot(N,w,j*w+n_plot+i+1)
             plt.plot(tobs[j], at[j,:,i].cpu().numpy(), '.r',linewidth=1.0)
             plt.plot(t_acts[j], act_hats[:,j,:,i].T,'-b',linewidth=.75)
             if j==0:
                 plt.title(ctrl.env.state_actions_names[ctrl.env.n+i],fontsize=25)
             plt.ylim([ctrl.env.ac_lb[i].item()-0.1,ctrl.env.ac_ub[i].item()+0.1])
         # plot reward
-        plt.subplot(N,w,j*w+ctrl.env.n+ctrl.env.m+1) 
+        plt.subplot(N,w,j*w+n_plot+m_plot+1) 
         # plt.plot(t[j,:-1], rt_hat[:,j].T,'-b')
         plt.plot(tobs[j], rt[j].cpu().numpy(),'or',markersize=4)
         if j==0:
             plt.title('rewards',fontsize=25)
         plt.ylim([ctrl.env.reward_range[0]-0.2,ctrl.env.reward_range[1]+0.2])
         # plot value
-        plt.subplot(N,w,j*w+ctrl.env.n+ctrl.env.m+2) 
+        plt.subplot(N,w,j*w+n_plot+m_plot+2) 
         # min,max = V[:,j].min().item(),V[:,j].max().item()
         # scaled_rew = (max-min)*rt[j]+min
         # plt.plot(t, scaled_rew.cpu().numpy(),'-or',markersize=3,linewidth=0.5)

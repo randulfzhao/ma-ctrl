@@ -88,6 +88,17 @@ class MaMuJoCoAnt2x4Env(BaseEnv):
         self.reward_range = [-10.0, 10.0]
         self.reset()
 
+    def __getstate__(self):
+        state = super().__getstate__()
+        if 'mamujoco' in state:
+            del state['mamujoco']
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        from gymnasium_robotics.envs.multiagent_mujoco import mamujoco_v1 as mamujoco
+        self.mamujoco = mamujoco
+
     def _make_env(self):
         return self.mamujoco.parallel_env(
             scenario=self.scenario,

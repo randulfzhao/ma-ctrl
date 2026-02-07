@@ -30,6 +30,18 @@ normalize_wandb_mode() {
   esac
 }
 
+normalize_launch_mode() {
+  local v="${1:-auto}"
+  v="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
+  case "$v" in
+    auto|direct|conda_run) echo "$v" ;;
+    *)
+      echo "[ant.sh] ERROR: LAUNCH_MODE must be one of {auto,direct,conda_run}, got: '$v'" >&2
+      exit 1
+      ;;
+  esac
+}
+
 has_wandb_login() {
   [[ -n "${WANDB_API_KEY:-}" ]] && return 0
   [[ -f "$HOME/.netrc" ]] || return 1
@@ -40,6 +52,7 @@ has_wandb_login() {
 # Run configuration (override any of these via env vars)
 # -----------------------------------------------------------------------------
 CONDA_ENV="${CONDA_ENV:-mbrl}"
+LAUNCH_MODE="$(normalize_launch_mode "${LAUNCH_MODE:-auto}")"
 DEVICE="${DEVICE:-cpu}"
 EPISODES="${EPISODES:-1000}"
 
@@ -88,6 +101,20 @@ export KMP_DUPLICATE_LIB_OK=TRUE
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 mkdir -p logs
 
+ACTIVE_CONDA_ENV="${CONDA_DEFAULT_ENV:-}"
+RESOLVED_LAUNCH_MODE="$LAUNCH_MODE"
+if [[ "$RESOLVED_LAUNCH_MODE" == "auto" ]]; then
+  if [[ -n "$ACTIVE_CONDA_ENV" && "$ACTIVE_CONDA_ENV" == "$CONDA_ENV" ]]; then
+    RESOLVED_LAUNCH_MODE="direct"
+  else
+    RESOLVED_LAUNCH_MODE="conda_run"
+  fi
+fi
+
+if [[ "$RESOLVED_LAUNCH_MODE" == "direct" && -n "$CONDA_ENV" && -n "$ACTIVE_CONDA_ENV" && "$ACTIVE_CONDA_ENV" != "$CONDA_ENV" ]]; then
+  echo "[ant.sh] WARNING: launch_mode=direct but active conda env is '$ACTIVE_CONDA_ENV' (expected '$CONDA_ENV')." >&2
+fi
+
 if [[ "$USE_WANDB" == "1" ]]; then
   if [[ "$WANDB_MODE" == "online" ]] && ! has_wandb_login; then
     cat <<'EOF' >&2
@@ -108,6 +135,8 @@ print_config() {
   cat <<EOF
 [ant.sh] Config
   conda_env           = $CONDA_ENV
+  active_conda_env    = ${ACTIVE_CONDA_ENV:-<none>}
+  launch_mode         = $LAUNCH_MODE -> $RESOLVED_LAUNCH_MODE
   device              = $DEVICE
   episodes            = $EPISODES
   dt                  = $DT
@@ -143,8 +172,15 @@ run_one_seed() {
   log_file="logs/ant2x4_enode_seed${seed}_${ts}.log"
   wandb_name="${WANDB_RUN_NAME_PREFIX}-seed${seed}-${ts}"
 
+  local -a cmd_prefix=()
+  if [[ "$RESOLVED_LAUNCH_MODE" == "direct" ]]; then
+    cmd_prefix=(python)
+  else
+    cmd_prefix=(conda run -n "$CONDA_ENV" python)
+  fi
+
   local -a cmd=(
-    conda run -n "$CONDA_ENV" python runner_coop_ma_enode.py
+    "${cmd_prefix[@]}" runner_coop_ma_enode.py
     --env ant2x4
     --episodes "$EPISODES"
     --dt "$DT"

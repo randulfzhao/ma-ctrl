@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np 
 import math
-from TorchDiffEqPack.odesolver import odesolve as torchdiffeqpack_odesolve
+from torchdiffeq import odeint
 
 def get_act(act="relu"):
     if act=="relu":         return nn.ReLU()
@@ -103,16 +103,12 @@ def smooth(x,w=7):
     return y
 
 def odesolve(f, z0, ts, step_size, method, rtol, atol):
-    options = {}
-    method = 'midpoint' if method=='RK2' else method
-    options.update({'method': method})
-    options.update({'step_size': step_size})
-    options.update({'t0': ts[0].item()})
-    options.update({'t1': ts[-1].item()})
-    options.update({'rtol': rtol})
-    options.update({'atol': atol})
-    options.update({'t_eval': ts.tolist()})
-    return torchdiffeqpack_odesolve(f, z0, options)
+    ts = ts.reshape(-1)
+    method = 'midpoint' if method == 'RK2' else method
+    # Keep compatibility with solver names used elsewhere in this repo.
+    method = {'rk45': 'dopri5', 'rk23': 'adaptive_heun'}.get(method, method)
+    opts = {'step_size': float(step_size)} if method in {'euler', 'midpoint', 'rk4'} else None
+    return odeint(f, z0, ts, method=method, rtol=rtol, atol=atol, options=opts)
     
 
 def Klinear(X1, X2, ell=1.0, sf=1.0, eps=1e-5):

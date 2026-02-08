@@ -21,6 +21,8 @@ import ctrl.ctrl as base
 from ctrl import utils
 from envs.base_env import BaseEnv
 
+FIXED_EPISODE_SECONDS = 2.5
+
 
 class MaMuJoCoAnt2x4Env(BaseEnv):
     """Ant 2x4 adapter so the ENODE pipeline can train on MaMuJoCo rollouts."""
@@ -105,6 +107,7 @@ class MaMuJoCoAnt2x4Env(BaseEnv):
             agent_conf=self.agent_conf,
             agent_obsk=self.agent_obsk,
             render_mode=None,
+            terminate_when_unhealthy=False,
         )
 
     def _obs_dict_to_joint(self, obs_dict):
@@ -346,7 +349,7 @@ def build_args():
     p.add_argument('--dt', type=float, default=0.1)
     p.add_argument('--noise', type=float, default=0.0)
     p.add_argument('--ts_grid', default='fixed', choices=['fixed', 'uniform', 'exp'])
-    p.add_argument('--solver', default='dopri5')
+    p.add_argument('--solver', default='rk4')
     p.add_argument('--rounds', type=int, default=50)
     p.add_argument('--episodes', type=int, default=None, help='Approximate number of episodes to train.')
     p.add_argument('--h_train', type=float, default=2.0)
@@ -364,6 +367,7 @@ def build_args():
     p.add_argument('--actor_lr', type=float, default=1e-4)
     p.add_argument('--critic_lr', type=float, default=1e-3)
     p.add_argument('--dyn_lr', type=float, default=1e-3)
+    p.add_argument('--dyn_grad_clip', type=float, default=10.0, help='Max grad norm for dynamics model; <=0 disables clipping.')
     p.add_argument('--rew_lr', type=float, default=1e-3)
     p.add_argument('--policy_batch_size', type=int, default=256)
     p.add_argument('--critic_updates', type=int, default=4)
@@ -419,15 +423,21 @@ def main():
 
     effective_agents = int(getattr(env, 'n_agents', args.n_agents))
 
-    # Align episode horizon to requested episode length.
-    horizon = args.episode_length * args.dt
-    if args.h_data <= 0:
-        args.h_data = horizon
-    if args.h_train <= 0:
-        args.h_train = horizon
+    # Use a fixed episode duration across training/eval and snap to integer steps.
+    fixed_episode_steps = max(1, int(np.round(FIXED_EPISODE_SECONDS / args.dt)))
+    horizon = fixed_episode_steps * args.dt
+    requested_horizon = args.episode_length * args.dt
+    if not np.isclose(requested_horizon, horizon, rtol=0.0, atol=1e-9):
+        print(
+            f"Overriding requested episode length ({requested_horizon:.4f}s) "
+            f"with fixed {horizon:.4f}s ({fixed_episode_steps} steps)."
+        )
+    args.episode_length = fixed_episode_steps
+    args.h_data = horizon
+    args.h_train = horizon
 
     # Align initial exploration budget in environment steps.
-    env.N0 = max(1, int(np.ceil(args.exploration_steps / args.episode_length)))
+    env.N0 = max(1, int(np.ceil(args.exploration_steps / fixed_episode_steps)))
 
     D = utils.collect_data(env, H=args.h_data, N=env.N0)
 
@@ -447,6 +457,8 @@ def main():
         nn_V=200,
         act_V='tanh',
     ).to(device)
+    # Use user-selected ODE solver for model rollouts; adaptive solvers can OOM in long backprop traces.
+    ctrl.set_solver(args.solver)
 
     print(
         f'Env={env.name}, agents={effective_agents}, dt={env.dt:.3f}, '
@@ -509,22 +521,25 @@ def main():
     print(
         f"seed={args.seed} ep_len={args.episode_length} rho={args.discount_rho} "
         f"actor_lr={args.actor_lr} critic_lr={args.critic_lr} dyn_lr={args.dyn_lr} "
-        f"explore_steps={args.exploration_steps} save_steps={args.model_save_interval}"
+        f"dyn_grad_clip={args.dyn_grad_clip} explore_steps={args.exploration_steps} "
+        f"save_steps={args.model_save_interval}"
     )
     if args.rew_lr != args.dyn_lr:
         print("Note: reward model is not separated in this codebase; rew_lr is logged but not used.")
 
     try:
         utils.plot_model(ctrl, D, L=args.L, H=args.h_train, rep_buf=min(10, D.N), fname=run_name + '-train.png')
-        utils.plot_test(ctrl, D, L=args.L, H=max(args.h_train, 2.5), N=min(5, max(3, D.N)), fname=run_name + '-test.png')
+        utils.plot_test(ctrl, D, L=args.L, H=FIXED_EPISODE_SECONDS, N=min(5, max(3, D.N)), fname=run_name + '-test.png')
         utils.train_loop(
             ctrl, D, run_name, rounds, L=args.L, H=args.h_train,
             policy_tau=policy_tau, actor_lr=args.actor_lr,
             critic_lr=args.critic_lr, soft_tau=args.soft_update_tau, dyn_lr=args.dyn_lr,
+            dyn_grad_clip=args.dyn_grad_clip,
             dyn_rep_buf=args.replay_buffer_size, model_save_interval_rounds=model_save_interval_rounds,
             dyn_save_every=model_save_interval_rounds, policy_save_every=model_save_interval_rounds,
             use_env_rewards=getattr(env, 'use_env_rewards', False),
             policy_batch_size=args.policy_batch_size, critic_updates=args.critic_updates,
+            eval_horizon_sec=FIXED_EPISODE_SECONDS,
             wandb_run=wandb_run
         )
     finally:

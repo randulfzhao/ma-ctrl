@@ -116,7 +116,7 @@ def plot_model(ctrl, D, rep_buf=10, H=None, L=10, fname=None, verbose=False, sav
         idxs = -1*torch.arange(rep_buf,0,-1)
         g,st,at,rt,tobs = D.extract_data(H, ctrl.is_cont, idx=idxs)
         st_hat, rt_hat, at_hat, t = \
-            ctrl.forward_simulate(tobs, st[:,0,:], g, L=L, compute_rew=False)
+            ctrl.forward_simulate(tobs, st[:,0,:], g, L=L, compute_rew=False, record_actions=True)
         if verbose: 
             print(st_hat.shape)
         plot_sequences(ctrl, fname, tobs, st, at, rt, t, st_hat, at_hat, rt_hat, verbose=verbose, savefig=savefig)
@@ -132,7 +132,7 @@ def plot_test(ctrl, D, N=None, H=None, L=10, fname=None, verbose=False, savefig=
         D = collect_test_sequences(ctrl, D, N=N, reset=False, explore=True)
         g,st,at,rt,tobs = D.extract_data(H, ctrl.is_cont)
         st_hat, rt_hat, at_hat, t = \
-            ctrl.forward_simulate(H, st[:,0,:], g, L=L, compute_rew=False)
+            ctrl.forward_simulate(H, st[:,0,:], g, L=L, compute_rew=False, record_actions=True)
         if verbose: 
             print(st_hat.shape)
         plot_sequences(ctrl, fname, tobs, st, at, rt, t, st_hat, at_hat, rt_hat, verbose=verbose, savefig=savefig)
@@ -145,8 +145,16 @@ def plot_sequences(ctrl, fname, tobs, st, at, rt, t, st_hat, at_hat, rt_hat, ver
     t      = t.cpu().detach().numpy() # T
     st_hat = st_hat.cpu().detach().numpy() # L,N,T,n
     rt_hat = rt_hat.cpu().detach().numpy() # L,N,T,m
-    err = (st_hat-st.cpu().numpy())**2 # L,N,T,n
-    err = err.mean(0).mean(0).mean(1)
+    st_np = st.cpu().numpy()
+    delta = st_hat - st_np
+    finite_mask = np.isfinite(delta)
+    if not finite_mask.all():
+        bad = int((~finite_mask).sum())
+        total = int(finite_mask.size)
+        print(f'[plot_sequences] WARNING: non-finite state prediction entries: {bad}/{total}')
+    # Bound before squaring to avoid overflow in diagnostic plots.
+    delta = np.clip(np.nan_to_num(delta, nan=0.0, posinf=1e6, neginf=-1e6), -1e6, 1e6)
+    err = (delta**2).mean(0).mean(0).mean(1)
     t_acts = torch.stack(list(at_hat.keys())).T
     act_hats = torch.stack(list(at_hat.values())).permute(1,2,0,3)
     t_acts   = t_acts.cpu().detach().numpy() # T
@@ -230,6 +238,7 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
     policy_batch_size = kwargs.get('policy_batch_size', 256)
     critic_updates = kwargs.get('critic_updates', 4)
     wandb_run = kwargs.get('wandb_run', None)
+    eval_horizon_sec = float(kwargs.get('eval_horizon_sec', 2.5))
     dyn_tr_fnc = get_train_functions(ctrl.dynamics)
     print('fname is {:s}'.format(fname))
     # plot_model(ctrl, D, H=H, L=L, rep_buf=10, fname=fname+'-train.png')
@@ -287,10 +296,12 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
         )
         # test the policy
         eval_t0 = time.perf_counter()
-        Htest,Ntest,Tup = 30,10,int(3.0/ctrl.env.dt)
+        Htest, Ntest = eval_horizon_sec, 10
+        Ttest = max(1, int(np.round(Htest / ctrl.env.dt)))
+        Tup = 0
         s0 = torch.stack([numpy_to_torch(ctrl.env.reset()) for _ in range(Ntest)]).to(ctrl.device) 
-        _,_,test_rewards,_ = ctrl.env.integrate_system(T=int(Htest//ctrl.env.dt), s0=s0, g=ctrl._g)
-        # get the rewards after 3 seconds to understand the pole never falls (reward must be >.9)
+        _,_,test_rewards,_ = ctrl.env.integrate_system(T=Ttest, s0=s0, g=ctrl._g)
+        # Evaluate over a fixed episode window.
         rewards_are_accumulated = getattr(ctrl.env, 'rewards_are_accumulated', False)
         if rewards_are_accumulated:
             true_test_rewards = test_rewards[..., -1].mean().item()
@@ -298,10 +309,10 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
         else:
             true_test_rewards = test_rewards[...,Tup:].mean().item()
             min_test_reward = test_rewards[...,Tup:].min().item()
-        st_hat, rt_hat, at_hat, t = ctrl.forward_simulate(Htest, s0, ctrl._g, compute_rew=True)
+        st_hat, rt_hat, at_hat, t = ctrl.forward_simulate(Htest, s0, ctrl._g, compute_rew=True, record_actions=True)
         rt_hat = ctrl.env.diff_obs_reward_(st_hat[:,:,:-1])
-        imagined_test_rewards = rt_hat[...,Tup:].mean().item()
-        imagined_min_reward = rt_hat[...,Tup:].min().item()
+        imagined_test_rewards = rt_hat[..., Tup:].mean().item()
+        imagined_min_reward = rt_hat[..., Tup:].min().item()
         reward_gap = true_test_rewards - imagined_test_rewards
         print('Model tested. True/imagined reward sum is {:.2f}/{:.2f}'.\
               format(true_test_rewards,imagined_test_rewards))
@@ -359,6 +370,8 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
             D = collect_experience(ctrl, D=D, N=Nexpseq, H=D.dt*D.T, reset=False, explore=True) 
             D = collect_experience(ctrl, D=D, N=1, H=D.dt*D.T, reset=True)
             experience_mode = 1
+        if dyn_rep_buf > 0 and D.N > int(dyn_rep_buf):
+            D.keep_last(int(dyn_rep_buf))
         data_dt = time.perf_counter() - data_t0
         new_sequences = max(0, int(D.N) - round_data_size_before)
         train_metrics = {
@@ -528,7 +541,9 @@ def train_policy(ctrl, D, H=2.0, Niter=250, verbose=True, tau=5.0, N=100, L=10, 
         noise_vec = ctrl.draw_noise(L)
         fs = ctrl.draw_f(L, noise_vec=noise_vec)
         policy_optimizer.zero_grad()
-        st, rt, at, ts = ctrl.forward_simulate(H, s0, ctrl._g, f=fs, L=L, tau=tau, compute_rew=True)
+        st, rt, at, ts = ctrl.forward_simulate(
+            H, s0, ctrl._g, f=fs, L=L, tau=tau, compute_rew=True, record_actions=False
+        )
         rew_int  = rt[:,:,-1].mean(0) # N
         if rt.isnan().any():
             print('Reward is nan. Breaking.')
@@ -602,7 +617,7 @@ def train_policy(ctrl, D, H=2.0, Niter=250, verbose=True, tau=5.0, N=100, L=10, 
     
 def dynamics_loss(ctrl, st, ts, at, g, L=1):
     f = ctrl.draw_f(L)
-    outputs = ctrl.forward_simulate(ts, st[:,0,:], g, f=f, L=L, compute_rew=False)
+    outputs = ctrl.forward_simulate(ts, st[:,0,:], g, f=f, L=L, compute_rew=False, record_actions=False)
     st_hat,at_hat = outputs[0], outputs[2]
     [N,T,n] = st.shape 
     [L,N,T,_] = st_hat.shape
@@ -615,7 +630,7 @@ def dynamics_loss(ctrl, st, ts, at, g, L=1):
 def train_dynamics(ctrl, D, Niter=1000, verbose=True, H=10, N=-1, L=1, eta=1e-3, eta_final=2e-4, \
         save_every=50, save_fname=None, func_KL=False, lr_sch=False, kl_w=1, rep_buf=-1, temp_opt=True, \
         num_plots=0, opt='adam', print_times=10, rnode=False, stop_mse=1e-3, nrep=3, \
-        wandb_run=None, round_idx=None):
+        wandb_run=None, round_idx=None, grad_clip=10.0):
     if save_fname is None:
         save_fname = ctrl.name
     opt_cls = get_opt(opt, temp=temp_opt)
@@ -644,7 +659,19 @@ def train_dynamics(ctrl, D, Niter=1000, verbose=True, H=10, N=-1, L=1, eta=1e-3,
         if math.isnan(loss.item()):
             print('Dynamics loss is nan, no gradient computation.')
             break
-        grad_norm_ = torch.norm(flatten_([p.grad for p in opt_pars if p is not None and p.grad is not None])).item()
+        grad_tensors = [p.grad for p in opt_pars if p is not None and p.grad is not None]
+        if len(grad_tensors) == 0:
+            print('Dynamics gradients are empty; skipping optimizer step.')
+            continue
+        grad_norm_pre_ = torch.norm(flatten_(grad_tensors)).item()
+        grad_norm_ = grad_norm_pre_
+        if grad_clip is not None and float(grad_clip) > 0:
+            torch.nn.utils.clip_grad_norm_(opt_pars, max_norm=float(grad_clip), error_if_nonfinite=False)
+            grad_norm_ = torch.norm(flatten_(grad_tensors)).item()
+        if not np.isfinite(grad_norm_):
+            print(f'Dynamics grad norm is non-finite ({grad_norm_}); skipping optimizer step.')
+            optimizer.zero_grad()
+            continue
         optimizer.step()
         losses.append(loss.item())
         mses.append(mse)
@@ -677,6 +704,7 @@ def train_dynamics(ctrl, D, Niter=1000, verbose=True, H=10, N=-1, L=1, eta=1e-3,
                 'dynamics/mse_cur': mse,
                 'dynamics/grad_norm': np.mean(grad_norms),
                 'dynamics/grad_norm_cur': grad_norm_,
+                'dynamics/grad_norm_pre_cur': grad_norm_pre_,
                 'dynamics/lr': current_dyn_lr,
             },
         )
@@ -705,6 +733,7 @@ def train_ode(ctrl, D, save_fname, verbose, print_times, **kwargs):
     dyn_lr = kwargs.get('dyn_lr', 1e-3)
     dyn_rep_buf = kwargs.get('dyn_rep_buf', 50)
     dyn_save_every = kwargs.get('dyn_save_every', 50)
+    dyn_grad_clip = kwargs.get('dyn_grad_clip', 10.0)
     if D.N==ctrl.env.N0: # if the training has just started
         print('Drift is being initialized with gradient matching.')
         ctrl0 = copy.deepcopy(ctrl)
@@ -716,7 +745,8 @@ def train_ode(ctrl, D, save_fname, verbose, print_times, **kwargs):
     for H_ in [ctrl.env.dt*5]:
         train_dynamics(ctrl, D, Niter=1250, L=kwargs['L'], H=H_, eta=dyn_lr, save_fname=save_fname, \
             verbose=verbose, print_times=print_times, rep_buf=dyn_rep_buf, nrep=3, save_every=dyn_save_every, \
-            wandb_run=kwargs.get('wandb_run', None), round_idx=kwargs.get('round_idx', None))
+            wandb_run=kwargs.get('wandb_run', None), round_idx=kwargs.get('round_idx', None), \
+            grad_clip=dyn_grad_clip)
 
 def train_deep_pilco(ctrl, D, save_fname, verbose, print_times, **kwargs):
     Niter = 5000
@@ -962,11 +992,6 @@ def get_high_f_uncertainty_iv(ctrl, D, N=1, rep_buf=5, nrep=5, L=10):
     scores = rt + var_
     winner_idx = scores.argsort().flip(0)
     return st[winner_idx[:N]]
-
-
-
-
-
 
 
 

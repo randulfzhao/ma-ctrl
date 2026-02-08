@@ -94,7 +94,7 @@ class CTRL(nn.Module):
     def draw_noise(self, L=1, true_rhs=False):
         return self._f._f.draw_noise(L=L)
 
-    def forward_simulate(self, H_ts, s0, g, f=None, L=10, tau=None, compute_rew=False):
+    def forward_simulate(self, H_ts, s0, g, f=None, L=10, tau=None, compute_rew=False, record_actions=False):
         ''' Performs forward simulation for L different vector fields
             If H_ts is a float, then we form a uniform time grid for integration [0, dt, 2dt, ..., H_ts].
             If H_ts is a torch vector (possibly nonuniform), H_ts is used as the integration time points
@@ -114,10 +114,10 @@ class CTRL(nn.Module):
         # integration time points is a uniform grid
         if isinstance(H_ts,float) or isinstance(H_ts,int):
             return self._f.forward_simulate(solver=self.solver, H=H_ts, s0=s0, f=f, g=g, L=L, \
-                                       tau=tau, compute_rew=compute_rew)
+                                       tau=tau, compute_rew=compute_rew, record_actions=record_actions)
         else:
             return self._f.forward_simulate_nonuniform_ts(solver=self.solver, ts=H_ts, s0=s0, f=f, g=g, L=L, \
-                                        tau=tau, compute_rew=compute_rew)
+                                        tau=tau, compute_rew=compute_rew, record_actions=record_actions)
             
     def reset_parameters(self,w=0.1):
         self._f.reset_parameters(w)

@@ -59,6 +59,17 @@ class Dataset:
         self.D  = self.D[:-N]
         self.ts = self.ts[:-N]
 
+    def keep_last(self, N):
+        N = int(max(0, N))
+        if N == 0:
+            self.D = self.D[:0]
+            self.ts = self.ts[:0]
+            return
+        if self.N <= N:
+            return
+        self.D = self.D[-N:]
+        self.ts = self.ts[-N:]
+
     @staticmethod
     def __compute_rewards_if_needed(env,D):
         ''' returns (s,a,r) '''

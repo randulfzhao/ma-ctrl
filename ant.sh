@@ -48,16 +48,37 @@ has_wandb_login() {
   grep -Eq 'machine[[:space:]]+api\.wandb\.ai' "$HOME/.netrc"
 }
 
+wandb_runtime_ok() {
+  python - <<'PY'
+import os
+import socket
+import sys
+
+try:
+    os.makedirs("logs/.wandb_runtime_check", exist_ok=True)
+    with open("logs/.wandb_runtime_check/probe.log", "w", encoding="utf-8") as f:
+        f.write("ok\n")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    s.close()
+except Exception:
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
 # -----------------------------------------------------------------------------
 # Run configuration (override any of these via env vars)
 # -----------------------------------------------------------------------------
 CONDA_ENV="${CONDA_ENV:-mbrl}"
 LAUNCH_MODE="$(normalize_launch_mode "${LAUNCH_MODE:-auto}")"
-DEVICE="${DEVICE:-cpu}"
+DEVICE="${DEVICE:-cuda:0}"
 EPISODES="${EPISODES:-1000}"
 
 DT="${DT:-0.05}"
 EPISODE_LENGTH="${EPISODE_LENGTH:-50}"
+SOLVER="${SOLVER:-rk4}"
+# SOLVER="${SOLVER:-dopri5}"
 HORIZON="$(python - <<PY
 dt = $DT
 ep_len = $EPISODE_LENGTH
@@ -77,6 +98,7 @@ SOFT_UPDATE_TAU="${SOFT_UPDATE_TAU:-0.001}"
 ACTOR_LR="${ACTOR_LR:-0.0001}"
 CRITIC_LR="${CRITIC_LR:-0.001}"
 DYN_LR="${DYN_LR:-0.001}"
+DYN_GRAD_CLIP="${DYN_GRAD_CLIP:-10.0}"
 REW_LR="${REW_LR:-0.001}"
 POLICY_BATCH_SIZE="${POLICY_BATCH_SIZE:-256}"
 CRITIC_UPDATES="${CRITIC_UPDATES:-4}"
@@ -129,6 +151,23 @@ EOF
   if [[ -n "$WANDB_BASE_URL" ]]; then
     export WANDB_BASE_URL
   fi
+  if ! wandb_runtime_ok; then
+    echo "[ant.sh] WARNING: wandb runtime checks failed (socket/filesystem). Disabling wandb for this run." >&2
+    USE_WANDB="0"
+  fi
+fi
+
+# If CUDA is requested but unavailable on this host, fall back to CPU so runs can start.
+if [[ "$DEVICE" == cuda* ]]; then
+  if ! python - <<'PY'
+import sys
+import torch
+sys.exit(0 if torch.cuda.is_available() else 1)
+PY
+  then
+    echo "[ant.sh] WARNING: DEVICE=$DEVICE requested, but CUDA is not available. Falling back to cpu." >&2
+    DEVICE="cpu"
+  fi
 fi
 
 print_config() {
@@ -141,6 +180,7 @@ print_config() {
   episodes            = $EPISODES
   dt                  = $DT
   episode_length      = $EPISODE_LENGTH
+  solver              = $SOLVER
   horizon_seconds     = $HORIZON
   h_data / h_train    = $H_DATA / $H_TRAIN
   replay_buffer_size  = $REPLAY_BUFFER_SIZE
@@ -148,6 +188,7 @@ print_config() {
   soft_update_tau     = $SOFT_UPDATE_TAU
   actor_lr / critic_lr= $ACTOR_LR / $CRITIC_LR
   dyn_lr / rew_lr     = $DYN_LR / $REW_LR
+  dyn_grad_clip       = $DYN_GRAD_CLIP
   policy_batch_size   = $POLICY_BATCH_SIZE
   critic_updates      = $CRITIC_UPDATES
   exploration_steps   = $EXPLORATION_STEPS
@@ -184,6 +225,7 @@ run_one_seed() {
     --env ant2x4
     --episodes "$EPISODES"
     --dt "$DT"
+    --solver "$SOLVER"
     --h_data "$H_DATA"
     --h_train "$H_TRAIN"
     --L "$L_SAMPLES"
@@ -197,6 +239,7 @@ run_one_seed() {
     --actor_lr "$ACTOR_LR"
     --critic_lr "$CRITIC_LR"
     --dyn_lr "$DYN_LR"
+    --dyn_grad_clip "$DYN_GRAD_CLIP"
     --rew_lr "$REW_LR"
     --policy_batch_size "$POLICY_BATCH_SIZE"
     --critic_updates "$CRITIC_UPDATES"

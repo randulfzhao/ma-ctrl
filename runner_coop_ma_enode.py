@@ -383,6 +383,7 @@ def build_args():
     p.add_argument('--critic_lr', type=float, default=1e-3)
     p.add_argument('--dyn_lr', type=float, default=1e-3)
     p.add_argument('--dyn_grad_clip', type=float, default=10.0, help='Max grad norm for dynamics model; <=0 disables clipping.')
+    p.add_argument('--dyn_batch_size', type=int, default=1024, help='Mini-batch size for each dynamics gradient step.')
     p.add_argument('--rew_lr', type=float, default=1e-3)
     p.add_argument('--policy_batch_size', type=int, default=256)
     p.add_argument('--critic_updates', type=int, default=4)
@@ -512,6 +513,26 @@ def main():
         f"{ctrl.name}-ma{effective_agents}-k{args.coupling_strength:.2f}-"
         f"cw{args.consensus_weight:.2f}-seed{args.seed}"
     )
+    runtime_device_info = {
+        'runtime_device': str(device),
+        'runtime_device_type': str(device.type),
+        'runtime_cuda_available': bool(torch.cuda.is_available()),
+        'runtime_cuda_device_count': int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        'runtime_cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
+    }
+    if device.type == 'cuda' and torch.cuda.is_available():
+        cuda_idx = int(device.index) if device.index is not None else 0
+        runtime_device_info['runtime_cuda_device_index'] = cuda_idx
+        runtime_device_info['runtime_cuda_device_name'] = torch.cuda.get_device_name(cuda_idx)
+    print(
+        'Runtime device info: '
+        f"device={runtime_device_info['runtime_device']} "
+        f"type={runtime_device_info['runtime_device_type']} "
+        f"cuda_available={runtime_device_info['runtime_cuda_available']} "
+        f"cuda_count={runtime_device_info['runtime_cuda_device_count']} "
+        f"cuda_visible_devices='{runtime_device_info['runtime_cuda_visible_devices']}' "
+        f"cuda_name={runtime_device_info.get('runtime_cuda_device_name', 'n/a')}"
+    )
     wandb_run = None
     if args.use_wandb:
         try:
@@ -547,15 +568,19 @@ def main():
                 'effective_agents': effective_agents,
                 'env_name': env.name,
                 'run_name': run_name,
+                **runtime_device_info,
             },
             allow_val_change=True,
         )
+        for key, value in runtime_device_info.items():
+            wandb_run.summary[key] = value
         print(f"wandb enabled: project={args.wandb_project}, run={wandb_run.name}")
     print(f"Training rounds={rounds} (target episodes={args.episodes})")
     print(
         f"seed={args.seed} ep_len={args.episode_length} rho={args.discount_rho} "
         f"actor_lr={args.actor_lr} critic_lr={args.critic_lr} dyn_lr={args.dyn_lr} "
-        f"dyn_grad_clip={args.dyn_grad_clip} dyn_max_episodes={args.dyn_max_episodes} "
+        f"dyn_grad_clip={args.dyn_grad_clip} dyn_batch_size={args.dyn_batch_size} "
+        f"dyn_max_episodes={args.dyn_max_episodes} "
         f"explore_steps={args.exploration_steps} "
         f"collect_workers={args.collect_parallel_workers} dyn_nrep={args.dyn_nrep} "
         f"new_eps_per_round={env.Nexpseq + 1} init_eps={env.N0} "
@@ -572,6 +597,7 @@ def main():
             policy_tau=policy_tau, actor_lr=args.actor_lr,
             critic_lr=args.critic_lr, soft_tau=args.soft_update_tau, dyn_lr=args.dyn_lr,
             dyn_grad_clip=args.dyn_grad_clip,
+            dyn_batch_size=args.dyn_batch_size,
             dyn_max_episodes=args.dyn_max_episodes,
             dyn_nrep=args.dyn_nrep,
             dyn_rep_buf=args.replay_buffer_size, model_save_interval_rounds=model_save_interval_rounds,

@@ -639,13 +639,14 @@ def dynamics_loss(ctrl, st, ts, at, g, L=1):
     mse = sq_err.mean().item()
     return mse, lhood, st_hat, at_hat  # N,T,n
 def train_dynamics(ctrl, D, Niter=1000, verbose=True, H=10, N=-1, L=1, eta=1e-3, eta_final=2e-4, \
-        save_every=50, save_fname=None, func_KL=False, lr_sch=False, kl_w=1, rep_buf=-1, temp_opt=True, \
+        save_every=50, save_fname=None, func_KL=False, lr_sch=False, kl_w=1, rep_buf=-1, temp_opt=False, \
         num_plots=0, opt='adam', print_times=10, rnode=False, stop_mse=1e-3, nrep=3, \
-        wandb_run=None, round_idx=None, grad_clip=10.0):
+        wandb_run=None, round_idx=None, grad_clip=10.0, batch_size=1024):
     if save_fname is None:
         save_fname = ctrl.name
     opt_cls = get_opt(opt, temp=temp_opt)
     losses, mses, lhoods, kls, grad_norms = [], [], [], [], []
+    interp_times, grad_step_times = [], []
     opt_pars = ctrl.dynamics_parameters
     optimizer = opt_cls(opt_pars,lr=eta)
     if verbose: 
@@ -653,12 +654,30 @@ def train_dynamics(ctrl, D, Niter=1000, verbose=True, H=10, N=-1, L=1, eta=1e-3,
     if verbose: 
         print(f'Dataset size = {list(D.shape)}')
     num_below_thresholds = 0
+    replay_pool_idx = np.arange(D.N)[-rep_buf:] if rep_buf > 0 else np.arange(D.N)
+    replay_pool_size = int(len(replay_pool_idx))
+    if replay_pool_size == 0:
+        raise ValueError('Dynamics replay pool is empty; cannot train dynamics.')
+
+    batch_size = int(batch_size)
+    nrep = int(max(1, nrep))
     for k in range(Niter):
-        idx_ = np.arange(D.N)[-rep_buf:] if rep_buf>0 else  np.arange(D.N)
-        g,st,at,rt,tobs = D.extract_data(H=H, idx=idx_, nrep=nrep, cont=ctrl.is_cont)
+        if batch_size > 0:
+            # Standard mini-batch SGD: sample trajectory indices with replacement.
+            idx_ = np.random.choice(replay_pool_idx, size=batch_size, replace=True)
+            nrep_eff = 1
+        else:
+            # Backward-compatible full-pool behavior.
+            idx_ = replay_pool_idx
+            nrep_eff = nrep
+        g,st,at,rt,tobs = D.extract_data(H=H, idx=idx_, nrep=nrep_eff, cont=ctrl.is_cont)
+        if hasattr(g, 'reset_timing'):
+            g.reset_timing()
+        grad_step_t0 = time.perf_counter()
         optimizer.zero_grad()
         mse, sum_lhood, st_hat, at_hat = dynamics_loss(ctrl, st, tobs, at, g, L=L) # lhood = N,T,n
-        loss   = -sum_lhood * D.T / (H/ctrl.env.dt) / nrep
+        normalizer = max(1, int(st.shape[0] * st.shape[1] * st.shape[2]))
+        loss = -sum_lhood / float(normalizer)
         lhood_ = sum_lhood.item()
         kl_ = 0.0
         if kl_w > 0:
@@ -684,15 +703,19 @@ def train_dynamics(ctrl, D, Niter=1000, verbose=True, H=10, N=-1, L=1, eta=1e-3,
             optimizer.zero_grad()
             continue
         optimizer.step()
+        grad_step_time = time.perf_counter() - grad_step_t0
+        interp_time = float(g.get_timing()) if hasattr(g, 'get_timing') else 0.0
         losses.append(loss.item())
         mses.append(mse)
         lhoods.append(lhood_)
         kls.append(kl_)
         grad_norms.append(grad_norm_)
+        interp_times.append(interp_time)
+        grad_step_times.append(grad_step_time)
         if verbose and k % max(1, Niter//print_times) == 0:
-            print('Iter:{:4d}/{:<4d} loss:{:<.3f} lhood:{:<.3f} KL:{:<.3f} mse:{:<.3f}  grad norm:{:.4f} T:{:d}'.\
+            print('Iter:{:4d}/{:<4d} loss:{:<.3f} lhood:{:<.3f} KL:{:<.3f} mse:{:<.3f}  grad norm:{:.4f} T:{:d} B:{:d}'.\
                 format(k, Niter, np.mean(losses), np.mean(lhoods), np.mean(kls), np.mean(mses), np.mean(grad_norms), \
-                st.shape[1]))
+                st.shape[1], st.shape[0]))
         if hasattr(optimizer, 'param_groups'):
             current_dyn_lr = float(optimizer.param_groups[0]['lr'])
         elif hasattr(optimizer, 'opt') and hasattr(optimizer.opt, 'param_groups'):
@@ -717,6 +740,12 @@ def train_dynamics(ctrl, D, Niter=1000, verbose=True, H=10, N=-1, L=1, eta=1e-3,
                 'dynamics/grad_norm_cur': grad_norm_,
                 'dynamics/grad_norm_pre_cur': grad_norm_pre_,
                 'dynamics/lr': current_dyn_lr,
+                'dynamics/batch_size_cur': int(st.shape[0]),
+                'dynamics/replay_pool_size': replay_pool_size,
+                'dynamics/time_interpolation_sec': np.mean(interp_times),
+                'dynamics/time_interpolation_sec_cur': interp_time,
+                'dynamics/time_grad_descent_sec': np.mean(grad_step_times),
+                'dynamics/time_grad_descent_sec_cur': grad_step_time,
             },
         )
         if (k+1)%save_every == 0:
@@ -749,6 +778,7 @@ def train_ode(ctrl, D, save_fname, verbose, print_times, **kwargs):
     dyn_save_every = kwargs.get('dyn_save_every', 50)
     dyn_grad_clip = kwargs.get('dyn_grad_clip', 10.0)
     dyn_nrep = max(1, int(kwargs.get('dyn_nrep', 3)))
+    dyn_batch_size = max(1, int(kwargs.get('dyn_batch_size', 1024)))
     if D.N==ctrl.env.N0: # if the training has just started
         print('Drift is being initialized with gradient matching.')
         ctrl0 = copy.deepcopy(ctrl)
@@ -758,8 +788,9 @@ def train_ode(ctrl, D, save_fname, verbose, print_times, **kwargs):
         ctrl = copy.deepcopy(ctrl0) if loss1>loss0 else ctrl
         print('Drift initialized.')
     for H_ in [ctrl.env.dt*5]:
-        train_dynamics(ctrl, D, Niter=1250, L=kwargs['L'], H=H_, eta=dyn_lr, save_fname=save_fname, \
-            verbose=verbose, print_times=print_times, rep_buf=dyn_rep_buf, nrep=dyn_nrep, save_every=dyn_save_every, \
+        train_dynamics(ctrl, D, Niter=1000, L=kwargs['L'], H=H_, eta=dyn_lr, save_fname=save_fname, \
+            verbose=verbose, print_times=print_times, rep_buf=dyn_rep_buf, nrep=dyn_nrep, \
+            batch_size=dyn_batch_size, save_every=dyn_save_every, \
             wandb_run=kwargs.get('wandb_run', None), round_idx=kwargs.get('round_idx', None), \
             grad_clip=dyn_grad_clip)
 
@@ -1007,10 +1038,6 @@ def get_high_f_uncertainty_iv(ctrl, D, N=1, rep_buf=5, nrep=5, L=10):
     scores = rt + var_
     winner_idx = scores.argsort().flip(0)
     return st[winner_idx[:N]]
-
-
-
-
 
 
 

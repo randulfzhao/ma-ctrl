@@ -1,4 +1,4 @@
-import torch, copy, numpy as np
+import torch, copy, numpy as np, time
 
 class Dataset:
     def __init__(self, env, D, ts):
@@ -122,7 +122,18 @@ class DiscreteActions:
         self.ts = ts.to(at.device) # N,T
         self.N  = self.ts.shape[0]
         self.max_idx  = self.at.shape[1]-1
+        self._call_time_accum = 0.0
+        self._timing_enabled = False
+
+    def reset_timing(self):
+        self._call_time_accum = 0.0
+        self._timing_enabled = True
+
+    def get_timing(self):
+        return float(self._call_time_accum)
+
     def __call__(self,s,t):
+        t0 = time.perf_counter() if self._timing_enabled else None
         # t = t.item() if isinstance(t,torch.Tensor) else t
         if t[0].item()>self.ts[0,-1].item(): # actions outside the defined range
             actions = self.at[:,-1]
@@ -133,12 +144,17 @@ class DiscreteActions:
         if actions.isnan().sum()>0:
             raise ValueError('Action interpolation is wrong!')
         if s.ndim==2:
-            return actions
+            out = actions
         elif s.ndim==3:
-            return torch.stack([actions]*s.shape[0])
+            out = torch.stack([actions]*s.shape[0])
         elif s.ndim==4:
             tmp = torch.stack([actions]*s.shape[1])
-            return torch.stack([tmp]*s.shape[0])
+            out = torch.stack([tmp]*s.shape[0])
+        else:
+            raise ValueError(f'Unsupported state rank for actions: {s.ndim}')
+        if self._timing_enabled:
+            self._call_time_accum += (time.perf_counter() - t0)
+        return out
 
 from utils.utils import KernelInterpolation
 class KernelInterpolatePolicy:
@@ -147,14 +163,29 @@ class KernelInterpolatePolicy:
         sfs  = 1.0 * torch.ones([N,1,1],device=at.device, dtype=torch.float32)
         ells = 0.5 * torch.ones([N,1,1],device=at.device, dtype=torch.float32)
         self.kernel_int = KernelInterpolation(sfs, ells, ts.unsqueeze(-1), at, eps=1e-5)
+        self._call_time_accum = 0.0
+        self._timing_enabled = False
+
+    def reset_timing(self):
+        self._call_time_accum = 0.0
+        self._timing_enabled = True
+
+    def get_timing(self):
+        return float(self._call_time_accum)
     
     def __call__(self,s,t):
+        t0 = time.perf_counter() if self._timing_enabled else None
         actions = self.kernel_int(t.unsqueeze(-1).unsqueeze(-1)) # N,1,n_out
         actions = actions.permute(1,0,2) # 1,N,n_out
         if s.ndim==2:
-            return actions
+            out = actions
         elif s.ndim==3:
-            return torch.cat([actions]*s.shape[0])
+            out = torch.cat([actions]*s.shape[0])
         elif s.ndim==4:
             tmp = torch.stack([actions]*s.shape[1])
-            return torch.stack([tmp]*s.shape[0])
+            out = torch.stack([tmp]*s.shape[0])
+        else:
+            raise ValueError(f'Unsupported state rank for actions: {s.ndim}')
+        if self._timing_enabled:
+            self._call_time_accum += (time.perf_counter() - t0)
+        return out

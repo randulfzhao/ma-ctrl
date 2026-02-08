@@ -3,6 +3,7 @@ import argparse
 from typing import List
 from pathlib import Path
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import numpy as np
@@ -36,6 +37,7 @@ class MaMuJoCoAnt2x4Env(BaseEnv):
         solver: str,
         consensus_weight: float = 0.0,
         ac_rew_const: float = 0.01,
+        num_env_workers: int = 1,
     ):
         try:
             from gymnasium_robotics.envs.multiagent_mujoco import mamujoco_v1 as mamujoco
@@ -49,6 +51,7 @@ class MaMuJoCoAnt2x4Env(BaseEnv):
         self.agent_conf = "2x4"
         self.agent_obsk = 1
         self.consensus_weight = consensus_weight
+        self.num_env_workers = max(1, int(num_env_workers))
         self.use_env_rewards = True
         self.rewards_are_accumulated = True
         self.use_solved_threshold = False
@@ -158,7 +161,8 @@ class MaMuJoCoAnt2x4Env(BaseEnv):
                 N = int(s0.shape[0])
             ts_single = self.dt * torch.arange(T, dtype=torch.float32, device=self.device)
             sts, ats, rts = [], [], []
-            for _ in range(N):
+
+            def _rollout_one_episode():
                 env = self._make_env()
                 obs, _ = env.reset()
                 st_ep, at_ep, rt_ep = [], [], []
@@ -187,7 +191,17 @@ class MaMuJoCoAnt2x4Env(BaseEnv):
                     if done:
                         break
                 env.close()
+                return st_ep, at_ep, rt_ep
 
+            workers = max(1, min(self.num_env_workers, N))
+            if workers == 1:
+                rollouts = [_rollout_one_episode() for _ in range(N)]
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = [executor.submit(_rollout_one_episode) for _ in range(N)]
+                    rollouts = [f.result() for f in futures]
+
+            for st_ep, at_ep, rt_ep in rollouts:
                 if len(st_ep) == 0:
                     st_ep.append(torch.zeros(self.n, dtype=torch.float32))
                     at_ep.append(torch.zeros(self.m, dtype=torch.float32))
@@ -362,6 +376,7 @@ def build_args():
     p.add_argument('--obs_trans', action='store_true', help='Use transformed observations if base env supports it.')
     p.add_argument('--episode_length', type=int, default=50)
     p.add_argument('--replay_buffer_size', type=int, default=104)
+    p.add_argument('--dyn_max_episodes', type=int, default=200, help='Hard cap on episodes used to train dynamics.')
     p.add_argument('--discount_rho', type=float, default=0.95)
     p.add_argument('--soft_update_tau', type=float, default=0.001)
     p.add_argument('--actor_lr', type=float, default=1e-4)
@@ -372,7 +387,17 @@ def build_args():
     p.add_argument('--policy_batch_size', type=int, default=256)
     p.add_argument('--critic_updates', type=int, default=4)
     p.add_argument('--exploration_steps', type=int, default=1000)
+    p.add_argument('--dyn_nrep', type=int, default=3, help='Parallel trajectory replicates used in each dynamics step.')
+    p.add_argument('--collect_parallel_workers', type=int, default=1, help='Parallel workers for episode collection.')
+    p.add_argument('--torch_num_threads', type=int, default=1, help='PyTorch intra-op threads.')
+    p.add_argument('--torch_num_interop_threads', type=int, default=1, help='PyTorch inter-op threads.')
     p.add_argument('--model_save_interval', type=int, default=1000)
+    p.add_argument(
+        '--new_episodes_per_round',
+        type=int,
+        default=None,
+        help='Number of new trajectories to add per round. If set, overrides env.Nexpseq with value-1.',
+    )
     p.add_argument('--seed', type=int, default=111)
     p.add_argument('--use_wandb', action='store_true')
     p.add_argument('--wandb_project', type=str, default='ma-ctrl')
@@ -386,6 +411,10 @@ def build_args():
 
 def main():
     args = build_args()
+    if args.torch_num_threads is not None and args.torch_num_threads > 0:
+        torch.set_num_threads(int(args.torch_num_threads))
+    if args.torch_num_interop_threads is not None and args.torch_num_interop_threads > 0:
+        torch.set_num_interop_threads(int(args.torch_num_interop_threads))
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -399,6 +428,7 @@ def main():
             ts_grid=args.ts_grid,
             solver=args.solver,
             consensus_weight=args.consensus_weight,
+            num_env_workers=args.collect_parallel_workers,
         )
     else:
         env_map = {
@@ -438,6 +468,10 @@ def main():
 
     # Align initial exploration budget in environment steps.
     env.N0 = max(1, int(np.ceil(args.exploration_steps / fixed_episode_steps)))
+    if args.new_episodes_per_round is not None:
+        if args.new_episodes_per_round < 1:
+            raise ValueError('--new_episodes_per_round must be >= 1')
+        env.Nexpseq = int(args.new_episodes_per_round) - 1
 
     D = utils.collect_data(env, H=args.h_data, N=env.N0)
 
@@ -521,7 +555,10 @@ def main():
     print(
         f"seed={args.seed} ep_len={args.episode_length} rho={args.discount_rho} "
         f"actor_lr={args.actor_lr} critic_lr={args.critic_lr} dyn_lr={args.dyn_lr} "
-        f"dyn_grad_clip={args.dyn_grad_clip} explore_steps={args.exploration_steps} "
+        f"dyn_grad_clip={args.dyn_grad_clip} dyn_max_episodes={args.dyn_max_episodes} "
+        f"explore_steps={args.exploration_steps} "
+        f"collect_workers={args.collect_parallel_workers} dyn_nrep={args.dyn_nrep} "
+        f"new_eps_per_round={env.Nexpseq + 1} init_eps={env.N0} "
         f"save_steps={args.model_save_interval}"
     )
     if args.rew_lr != args.dyn_lr:
@@ -535,6 +572,8 @@ def main():
             policy_tau=policy_tau, actor_lr=args.actor_lr,
             critic_lr=args.critic_lr, soft_tau=args.soft_update_tau, dyn_lr=args.dyn_lr,
             dyn_grad_clip=args.dyn_grad_clip,
+            dyn_max_episodes=args.dyn_max_episodes,
+            dyn_nrep=args.dyn_nrep,
             dyn_rep_buf=args.replay_buffer_size, model_save_interval_rounds=model_save_interval_rounds,
             dyn_save_every=model_save_interval_rounds, policy_save_every=model_save_interval_rounds,
             use_env_rewards=getattr(env, 'use_env_rewards', False),

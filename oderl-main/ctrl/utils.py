@@ -232,6 +232,17 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
     model_save_interval_rounds = kwargs.get('model_save_interval_rounds', 1)
     dyn_lr = kwargs.get('dyn_lr', 1e-3)
     dyn_rep_buf = kwargs.get('dyn_rep_buf', 50)
+    dyn_max_episodes = max(1, int(kwargs.get('dyn_max_episodes', 200)))
+    dyn_rep_buf_requested = int(dyn_rep_buf)
+    if dyn_rep_buf_requested <= 0:
+        dyn_rep_buf = dyn_max_episodes
+    else:
+        dyn_rep_buf = min(dyn_rep_buf_requested, dyn_max_episodes)
+    if verbose and dyn_rep_buf_requested > dyn_max_episodes:
+        print(
+            f'Dynamics replay buffer requested {dyn_rep_buf_requested}, '
+            f'capped to max episodes {dyn_max_episodes}.'
+        )
     dyn_save_every = kwargs.get('dyn_save_every', 50)
     policy_save_every = kwargs.get('policy_save_every', 50)
     use_env_rewards = kwargs.get('use_env_rewards', getattr(ctrl.env, 'use_env_rewards', False))
@@ -370,7 +381,7 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
             D = collect_experience(ctrl, D=D, N=Nexpseq, H=D.dt*D.T, reset=False, explore=True) 
             D = collect_experience(ctrl, D=D, N=1, H=D.dt*D.T, reset=True)
             experience_mode = 1
-        if dyn_rep_buf > 0 and D.N > int(dyn_rep_buf):
+        if D.N > int(dyn_rep_buf):
             D.keep_last(int(dyn_rep_buf))
         data_dt = time.perf_counter() - data_t0
         new_sequences = max(0, int(D.N) - round_data_size_before)
@@ -731,9 +742,13 @@ def compute_full_batch_loss(ctrl, D, L=10):
 
 def train_ode(ctrl, D, save_fname, verbose, print_times, **kwargs):
     dyn_lr = kwargs.get('dyn_lr', 1e-3)
-    dyn_rep_buf = kwargs.get('dyn_rep_buf', 50)
+    dyn_rep_buf = min(
+        max(1, int(kwargs.get('dyn_rep_buf', 50))),
+        max(1, int(kwargs.get('dyn_max_episodes', 200))),
+    )
     dyn_save_every = kwargs.get('dyn_save_every', 50)
     dyn_grad_clip = kwargs.get('dyn_grad_clip', 10.0)
+    dyn_nrep = max(1, int(kwargs.get('dyn_nrep', 3)))
     if D.N==ctrl.env.N0: # if the training has just started
         print('Drift is being initialized with gradient matching.')
         ctrl0 = copy.deepcopy(ctrl)
@@ -744,7 +759,7 @@ def train_ode(ctrl, D, save_fname, verbose, print_times, **kwargs):
         print('Drift initialized.')
     for H_ in [ctrl.env.dt*5]:
         train_dynamics(ctrl, D, Niter=1250, L=kwargs['L'], H=H_, eta=dyn_lr, save_fname=save_fname, \
-            verbose=verbose, print_times=print_times, rep_buf=dyn_rep_buf, nrep=3, save_every=dyn_save_every, \
+            verbose=verbose, print_times=print_times, rep_buf=dyn_rep_buf, nrep=dyn_nrep, save_every=dyn_save_every, \
             wandb_run=kwargs.get('wandb_run', None), round_idx=kwargs.get('round_idx', None), \
             grad_clip=dyn_grad_clip)
 
@@ -992,9 +1007,6 @@ def get_high_f_uncertainty_iv(ctrl, D, N=1, rep_buf=5, nrep=5, L=10):
     scores = rt + var_
     winner_idx = scores.argsort().flip(0)
     return st[winner_idx[:N]]
-
-
-
 
 
 

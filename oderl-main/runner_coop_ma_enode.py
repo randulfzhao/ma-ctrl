@@ -155,6 +155,7 @@ def build_args():
     p.add_argument('--L', type=int, default=30)
     p.add_argument('--n_ens', type=int, default=5)
     p.add_argument('--dyn_grad_clip', type=float, default=10.0, help='Max grad norm for dynamics model; <=0 disables clipping.')
+    p.add_argument('--dyn_max_episodes', type=int, default=200, help='Hard cap on episodes used to train dynamics.')
     p.add_argument('--coupling_strength', type=float, default=0.2)
     p.add_argument('--consensus_weight', type=float, default=0.1)
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -217,7 +218,10 @@ def main():
 
     utils.plot_model(ctrl, D, L=args.L, H=args.h_train, rep_buf=min(10, D.N), fname=run_name + '-train.png')
     utils.plot_test(ctrl, D, L=args.L, H=max(args.h_train, 2.5), N=min(5, max(3, D.N)), fname=run_name + '-test.png')
-    utils.train_loop(ctrl, D, run_name, args.rounds, L=args.L, H=args.h_train, dyn_grad_clip=args.dyn_grad_clip)
+    utils.train_loop(
+        ctrl, D, run_name, args.rounds, L=args.L, H=args.h_train,
+        dyn_grad_clip=args.dyn_grad_clip, dyn_max_episodes=args.dyn_max_episodes
+    )
 
 
 if __name__ == '__main__':

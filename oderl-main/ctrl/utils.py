@@ -1,5 +1,6 @@
 import numpy as np
 import copy, math, os, collections, time
+from concurrent.futures import ThreadPoolExecutor
 import matplotlib.pyplot as plt
 plt.switch_backend('agg')
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
@@ -250,14 +251,31 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
     critic_updates = kwargs.get('critic_updates', 4)
     wandb_run = kwargs.get('wandb_run', None)
     eval_horizon_sec = float(kwargs.get('eval_horizon_sec', 2.5))
+    use_window_cache = bool(kwargs.get('use_window_cache', True))
+    dyn_window_steps = max(1, int(kwargs.get('dyn_window_steps', 5)))
+    dyn_window_h = float(ctrl.env.dt * dyn_window_steps)
     dyn_tr_fnc = get_train_functions(ctrl.dynamics)
     print('fname is {:s}'.format(fname))
     # plot_model(ctrl, D, H=H, L=L, rep_buf=10, fname=fname+'-train.png')
     r0 = int( (D.N-ctrl.env.N0) / (1+ctrl.env.Nexpseq) )
+    if use_window_cache and ctrl.is_cont:
+        cache_t0 = time.perf_counter()
+        D.prepare_parallel_window_cache(H=dyn_window_h, cont=True)
+        cache_dt = time.perf_counter() - cache_t0
+        if verbose:
+            print(
+                f'Prepared initial interpolation cache: H={dyn_window_h:.4f}s '
+                f'(steps={dyn_window_steps}), elapsed={cache_dt:.3f}s'
+            )
     for round in range(r0,r0+Nround):
         print(f'Round {round}/{r0+Nround} starting')
         round_start_time = time.perf_counter()
         round_data_size_before = int(D.N)
+        cache_prepare_dt = 0.0
+        if use_window_cache and ctrl.is_cont:
+            cache_prepare_t0 = time.perf_counter()
+            D.prepare_parallel_window_cache(H=dyn_window_h, cont=True)
+            cache_prepare_dt = time.perf_counter() - cache_prepare_t0
         _wandb_log(
             wandb_run,
             {
@@ -281,6 +299,8 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
         train_kwargs['dyn_save_every'] = dyn_save_every
         train_kwargs['wandb_run'] = wandb_run
         train_kwargs['round_idx'] = round
+        train_kwargs['use_window_cache'] = use_window_cache
+        train_kwargs['dyn_window_steps'] = dyn_window_steps
         dyn_tr_fnc(ctrl, D, fname, verbose, print_times, **train_kwargs)
         dynamics_dt = time.perf_counter() - dynamics_t0
         _wandb_log(
@@ -288,6 +308,7 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
             {
                 'train/round': round,
                 'train/time_dynamics_sec': dynamics_dt,
+                'train/time_interpolation_prepare_sec': cache_prepare_dt,
             },
         )
         # policy learning
@@ -383,6 +404,11 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
             experience_mode = 1
         if D.N > int(dyn_rep_buf):
             D.keep_last(int(dyn_rep_buf))
+        interp_cache_dt = 0.0
+        if use_window_cache and ctrl.is_cont:
+            interp_cache_t0 = time.perf_counter()
+            D.prepare_parallel_window_cache(H=dyn_window_h, cont=True)
+            interp_cache_dt = time.perf_counter() - interp_cache_t0
         data_dt = time.perf_counter() - data_t0
         new_sequences = max(0, int(D.N) - round_data_size_before)
         train_metrics = {
@@ -391,6 +417,7 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
             'train/new_sequences': new_sequences,
             'train/dataset_size': D.N,
             'train/time_data_collection_sec': data_dt,
+            'train/time_interpolation_cache_sec': interp_cache_dt,
             'train/time_round_total_sec': time.perf_counter() - round_start_time,
             'train/solved': 0,
         }
@@ -641,7 +668,8 @@ def dynamics_loss(ctrl, st, ts, at, g, L=1):
 def train_dynamics(ctrl, D, Niter=1000, verbose=True, H=10, N=-1, L=1, eta=1e-3, eta_final=2e-4, \
         save_every=50, save_fname=None, func_KL=False, lr_sch=False, kl_w=1, rep_buf=-1, temp_opt=False, \
         num_plots=0, opt='adam', print_times=10, rnode=False, stop_mse=1e-3, nrep=3, \
-        wandb_run=None, round_idx=None, grad_clip=10.0, batch_size=1024):
+        wandb_run=None, round_idx=None, grad_clip=10.0, batch_size=1024, \
+        use_window_cache=True, cache_sf=1.0, cache_ell=0.5, cache_eps=1e-5):
     if save_fname is None:
         save_fname = ctrl.name
     opt_cls = get_opt(opt, temp=temp_opt)
@@ -661,6 +689,18 @@ def train_dynamics(ctrl, D, Niter=1000, verbose=True, H=10, N=-1, L=1, eta=1e-3,
 
     batch_size = int(batch_size)
     nrep = int(max(1, nrep))
+    use_window_cache = bool(use_window_cache) and bool(ctrl.is_cont)
+    if use_window_cache:
+        cache_t0 = time.perf_counter()
+        cache = D.prepare_parallel_window_cache(
+            H=H, cont=True, sf=cache_sf, ell=cache_ell, eps=cache_eps
+        )
+        cache_dt = time.perf_counter() - cache_t0
+        if verbose:
+            print(
+                f'Using cached interpolation windows: total_windows={cache["st"].shape[0]}, '
+                f'window_steps={cache["T"]}, build_time={cache_dt:.3f}s'
+            )
     for k in range(Niter):
         if batch_size > 0:
             # Standard mini-batch SGD: sample trajectory indices with replacement.
@@ -670,7 +710,16 @@ def train_dynamics(ctrl, D, Niter=1000, verbose=True, H=10, N=-1, L=1, eta=1e-3,
             # Backward-compatible full-pool behavior.
             idx_ = replay_pool_idx
             nrep_eff = nrep
-        g,st,at,rt,tobs = D.extract_data(H=H, idx=idx_, nrep=nrep_eff, cont=ctrl.is_cont)
+        g,st,at,rt,tobs = D.extract_data(
+            H=H,
+            idx=idx_,
+            nrep=nrep_eff,
+            cont=ctrl.is_cont,
+            use_window_cache=use_window_cache,
+            cache_sf=cache_sf,
+            cache_ell=cache_ell,
+            cache_eps=cache_eps,
+        )
         if hasattr(g, 'reset_timing'):
             g.reset_timing()
         grad_step_t0 = time.perf_counter()
@@ -771,6 +820,8 @@ def compute_full_batch_loss(ctrl, D, L=10):
 
 def train_ode(ctrl, D, save_fname, verbose, print_times, **kwargs):
     dyn_lr = kwargs.get('dyn_lr', 1e-3)
+    dyn_update_steps = max(1, int(kwargs.get('dyn_update_steps', 1000)))
+    dyn_window_steps = max(1, int(kwargs.get('dyn_window_steps', 5)))
     dyn_rep_buf = min(
         max(1, int(kwargs.get('dyn_rep_buf', 50))),
         max(1, int(kwargs.get('dyn_max_episodes', 200))),
@@ -779,6 +830,10 @@ def train_ode(ctrl, D, save_fname, verbose, print_times, **kwargs):
     dyn_grad_clip = kwargs.get('dyn_grad_clip', 10.0)
     dyn_nrep = max(1, int(kwargs.get('dyn_nrep', 3)))
     dyn_batch_size = max(1, int(kwargs.get('dyn_batch_size', 1024)))
+    use_window_cache = bool(kwargs.get('use_window_cache', True))
+    cache_sf = float(kwargs.get('cache_sf', 1.0))
+    cache_ell = float(kwargs.get('cache_ell', 0.5))
+    cache_eps = float(kwargs.get('cache_eps', 1e-5))
     if D.N==ctrl.env.N0: # if the training has just started
         print('Drift is being initialized with gradient matching.')
         ctrl0 = copy.deepcopy(ctrl)
@@ -787,12 +842,13 @@ def train_ode(ctrl, D, save_fname, verbose, print_times, **kwargs):
         loss1 = compute_full_batch_loss(ctrl, D)
         ctrl = copy.deepcopy(ctrl0) if loss1>loss0 else ctrl
         print('Drift initialized.')
-    for H_ in [ctrl.env.dt*5]:
-        train_dynamics(ctrl, D, Niter=1000, L=kwargs['L'], H=H_, eta=dyn_lr, save_fname=save_fname, \
+    for H_ in [ctrl.env.dt * dyn_window_steps]:
+        train_dynamics(ctrl, D, Niter=dyn_update_steps, L=kwargs['L'], H=H_, eta=dyn_lr, save_fname=save_fname, \
             verbose=verbose, print_times=print_times, rep_buf=dyn_rep_buf, nrep=dyn_nrep, \
             batch_size=dyn_batch_size, save_every=dyn_save_every, \
             wandb_run=kwargs.get('wandb_run', None), round_idx=kwargs.get('round_idx', None), \
-            grad_clip=dyn_grad_clip)
+            grad_clip=dyn_grad_clip, use_window_cache=use_window_cache, \
+            cache_sf=cache_sf, cache_ell=cache_ell, cache_eps=cache_eps)
 
 def train_deep_pilco(ctrl, D, save_fname, verbose, print_times, **kwargs):
     Niter = 5000
@@ -893,8 +949,8 @@ def get_kernel_interpolation(env, T, N=1, ell=0.25, sf=0.5):
             return kernel_int(torch.stack([t.view([1,1])]*N)).squeeze(1)
         return g
     
-def build_policy(env, T, g_pol=None, sf=0.1, ell=0.5):
-    g_exp = get_kernel_interpolation(env, T, ell=ell, sf=sf)
+def build_policy(env, T, g_pol=None, sf=0.1, ell=0.5, N=1):
+    g_exp = get_kernel_interpolation(env, T, N=N, ell=ell, sf=sf)
     tanh_ = torch.nn.Tanh()
     def g(s,t):
         a_pol = g_pol(s,t) if g_pol is not None else 0.0
@@ -909,36 +965,75 @@ def collect_data(env, H, N=1, sf=0.5, ell=0.5, D=None):
             print('Since N<1, data not collected!')
             return D
         T = int(H/env.dt)
-        s0 = torch.stack([numpy_to_torch(env.reset(), env.device) for _ in range(N)]) # N,n
-        for i in range(N):
-            g = build_policy(env,T)
-            st,at,rt,ts = env.integrate_system(T, g, s0[i:i+1])
-            st_at_rt = torch.cat([st,at,rt.unsqueeze(-1)],-1) # N,T,n+m+1
-            if D is None:
-                D = Dataset(env, st_at_rt, ts)
+        is_mamujoco = hasattr(env, 'mamujoco')
+        if is_mamujoco and N > 1:
+            # MaMuJoCo requires one policy per episode; collect episodes in parallel.
+            workers = max(1, int(getattr(env, 'num_env_workers', 1)))
+            workers = min(workers, int(N))
+            # Build exploration policies on the main thread to avoid CUDA linear
+            # algebra races in per-thread GP sampling.
+            policies = [build_policy(env, T, sf=sf, ell=ell, N=1) for _ in range(N)]
+
+            def _rollout_one(g):
+                return env.integrate_system(T, g, N=1)
+
+            if workers == 1:
+                rollouts = [_rollout_one(g) for g in policies]
             else:
-                D.add_experience(st_at_rt, ts)
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = [executor.submit(_rollout_one, g) for g in policies]
+                    rollouts = [f.result() for f in futures]
+            st = torch.cat([x[0] for x in rollouts], dim=0)
+            at = torch.cat([x[1] for x in rollouts], dim=0)
+            rt = torch.cat([x[2] for x in rollouts], dim=0)
+            ts = torch.cat([x[3] for x in rollouts], dim=0)
+        else:
+            # Non-MaMuJoCo envs can collect in a single batched rollout.
+            s0 = torch.stack([numpy_to_torch(env.reset(), env.device) for _ in range(N)]) # N,n
+            g = build_policy(env, T, sf=sf, ell=ell, N=N)
+            st,at,rt,ts = env.integrate_system(T, g, s0=s0, N=N)
+        st_at_rt = torch.cat([st,at,rt.unsqueeze(-1)],-1) # N,T,n+m+1
+        if D is None:
+            D = Dataset(env, st_at_rt, ts)
+        else:
+            D.add_experience(st_at_rt, ts)
         return D
 
 def collect_test_sequences(ctrl, D, N=1, reset=True, explore=False, sf=0.1):
     with torch.no_grad():
         env = ctrl.env
-        Dnew = None
         T = D.T
         if reset:
             s0 = torch.stack([torch.tensor(env.reset(),dtype=torch.float32)\
                    for _ in range(N)]).to(ctrl.device)
         else:
             s0 = get_high_f_uncertainty_iv(ctrl, D, N=N)
-        for i in range(N):
-            g = build_policy(env, T, sf=sf) if explore else ctrl._g
-            st_obs,at,rt,ts = env.integrate_system(T, g, s0[i:i+1])
-            st_at_rt = torch.cat([st_obs,at,rt.unsqueeze(-1)],-1) # T,n+m+1
-            if Dnew is None:
-                Dnew = Dataset(env, st_at_rt, ts)
+        is_mamujoco = hasattr(env, 'mamujoco')
+        if is_mamujoco and explore and N > 1:
+            workers = max(1, int(getattr(env, 'num_env_workers', 1)))
+            workers = min(workers, int(N))
+            # Build exploration policies on main thread to avoid concurrent
+            # CUDA factorization in GP action sampling.
+            policies = [build_policy(env, T, sf=sf, N=1) for _ in range(N)]
+
+            def _rollout_one(i, g):
+                return env.integrate_system(T, g, s0=s0[i:i+1])
+
+            if workers == 1:
+                rollouts = [_rollout_one(i, policies[i]) for i in range(N)]
             else:
-                Dnew.add_experience(st_at_rt, ts)
-        return Dnew
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = [executor.submit(_rollout_one, i, policies[i]) for i in range(N)]
+                    rollouts = [f.result() for f in futures]
+            st_obs = torch.cat([x[0] for x in rollouts], dim=0)
+            at = torch.cat([x[1] for x in rollouts], dim=0)
+            rt = torch.cat([x[2] for x in rollouts], dim=0)
+            ts = torch.cat([x[3] for x in rollouts], dim=0)
+        else:
+            g = build_policy(env, T, sf=sf, N=N) if explore else ctrl._g
+            st_obs,at,rt,ts = env.integrate_system(T, g, s0=s0, N=N)
+        st_at_rt = torch.cat([st_obs,at,rt.unsqueeze(-1)],-1) # N,T,n+m+1
+        return Dataset(env, st_at_rt, ts)
 
 
 def collect_experience(ctrl, D, N=1, H=None, reset=False, explore=False, sf=0.1):
@@ -1038,9 +1133,3 @@ def get_high_f_uncertainty_iv(ctrl, D, N=1, rep_buf=5, nrep=5, L=10):
     scores = rt + var_
     winner_idx = scores.argsort().flip(0)
     return st[winner_idx[:N]]
-
-
-
-
-
-

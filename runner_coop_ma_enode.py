@@ -384,6 +384,8 @@ def build_args():
     p.add_argument('--dyn_lr', type=float, default=1e-3)
     p.add_argument('--dyn_grad_clip', type=float, default=10.0, help='Max grad norm for dynamics model; <=0 disables clipping.')
     p.add_argument('--dyn_batch_size', type=int, default=1024, help='Mini-batch size for each dynamics gradient step.')
+    p.add_argument('--dyn_update_steps', type=int, default=1000, help='Number of gradient descent steps per dynamics update.')
+    p.add_argument('--dyn_window_steps', type=int, default=5, help='Raw (non-interpolated) steps per sampled dynamics chain.')
     p.add_argument('--rew_lr', type=float, default=1e-3)
     p.add_argument('--policy_batch_size', type=int, default=256)
     p.add_argument('--critic_updates', type=int, default=4)
@@ -580,6 +582,7 @@ def main():
         f"seed={args.seed} ep_len={args.episode_length} rho={args.discount_rho} "
         f"actor_lr={args.actor_lr} critic_lr={args.critic_lr} dyn_lr={args.dyn_lr} "
         f"dyn_grad_clip={args.dyn_grad_clip} dyn_batch_size={args.dyn_batch_size} "
+        f"dyn_update_steps={args.dyn_update_steps} dyn_window_steps={args.dyn_window_steps} "
         f"dyn_max_episodes={args.dyn_max_episodes} "
         f"explore_steps={args.exploration_steps} "
         f"collect_workers={args.collect_parallel_workers} dyn_nrep={args.dyn_nrep} "
@@ -598,6 +601,8 @@ def main():
             critic_lr=args.critic_lr, soft_tau=args.soft_update_tau, dyn_lr=args.dyn_lr,
             dyn_grad_clip=args.dyn_grad_clip,
             dyn_batch_size=args.dyn_batch_size,
+            dyn_update_steps=args.dyn_update_steps,
+            dyn_window_steps=args.dyn_window_steps,
             dyn_max_episodes=args.dyn_max_episodes,
             dyn_nrep=args.dyn_nrep,
             dyn_rep_buf=args.replay_buffer_size, model_save_interval_rounds=model_save_interval_rounds,

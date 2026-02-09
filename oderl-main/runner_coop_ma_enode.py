@@ -1,6 +1,8 @@
 import os
 import argparse
 from typing import List
+from pathlib import Path
+from datetime import datetime
 
 import torch
 
@@ -11,6 +13,28 @@ import envs
 import ctrl.ctrl as base
 from ctrl import utils
 from envs.base_env import BaseEnv
+
+
+def _make_indexed_output_prefix(run_name: str) -> str:
+    now = datetime.now()
+    date_dir = Path("output") / now.strftime("%Y%m%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    time_tag = now.strftime("%H%M%S")
+    next_idx = 1
+    for child in date_dir.iterdir():
+        if not child.is_dir():
+            continue
+        idx_token = child.name.split("_", 1)[0]
+        if idx_token.isdigit():
+            next_idx = max(next_idx, int(idx_token) + 1)
+    while True:
+        run_dir = date_dir / f"{next_idx:03d}_{time_tag}_{run_name}"
+        try:
+            run_dir.mkdir(parents=False, exist_ok=False)
+            break
+        except FileExistsError:
+            next_idx += 1
+    return str(run_dir / run_name)
 
 
 class CooperativeCoupledEnv(BaseEnv):
@@ -215,11 +239,13 @@ def main():
         f"{ctrl.name}-ma{args.n_agents}-k{args.coupling_strength:.2f}-"
         f"cw{args.consensus_weight:.2f}"
     )
+    run_output_prefix = _make_indexed_output_prefix(run_name)
+    print(f"output_prefix={run_output_prefix}")
 
-    utils.plot_model(ctrl, D, L=args.L, H=args.h_train, rep_buf=min(10, D.N), fname=run_name + '-train.png')
-    utils.plot_test(ctrl, D, L=args.L, H=max(args.h_train, 2.5), N=min(5, max(3, D.N)), fname=run_name + '-test.png')
+    utils.plot_model(ctrl, D, L=args.L, H=args.h_train, rep_buf=min(10, D.N), fname=run_output_prefix + '-train.png')
+    utils.plot_test(ctrl, D, L=args.L, H=max(args.h_train, 2.5), N=min(5, max(3, D.N)), fname=run_output_prefix + '-test.png')
     utils.train_loop(
-        ctrl, D, run_name, args.rounds, L=args.L, H=args.h_train,
+        ctrl, D, run_output_prefix, args.rounds, L=args.L, H=args.h_train,
         dyn_grad_clip=args.dyn_grad_clip, dyn_max_episodes=args.dyn_max_episodes
     )
 

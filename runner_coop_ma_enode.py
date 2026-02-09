@@ -2,6 +2,7 @@ import os
 import argparse
 from typing import List
 from pathlib import Path
+from datetime import datetime
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -23,13 +24,48 @@ from ctrl import utils
 from envs.base_env import BaseEnv
 
 FIXED_EPISODE_SECONDS = 2.5
+MAMUJOCO_ENV_SPECS = {
+    "ant2x4": ("Ant", "2x4"),
+    "ant2x4d": ("Ant", "2x4d"),
+    "ant4x2": ("Ant", "4x2"),
+    "walker": ("Walker2d", "2x3"),
+    "walker2x3": ("Walker2d", "2x3"),
+    "cheetah": ("HalfCheetah", "6x1"),
+    "cheetah6x1": ("HalfCheetah", "6x1"),
+    "swimmer": ("Swimmer", "2x1"),
+    "swimmer2x1": ("Swimmer", "2x1"),
+}
 
 
-class MaMuJoCoAnt2x4Env(BaseEnv):
-    """Ant 2x4 adapter so the ENODE pipeline can train on MaMuJoCo rollouts."""
+def _make_indexed_output_prefix(run_name: str) -> str:
+    now = datetime.now()
+    date_dir = Path("output") / now.strftime("%Y%m%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    time_tag = now.strftime("%H%M%S")
+    next_idx = 1
+    for child in date_dir.iterdir():
+        if not child.is_dir():
+            continue
+        idx_token = child.name.split("_", 1)[0]
+        if idx_token.isdigit():
+            next_idx = max(next_idx, int(idx_token) + 1)
+    while True:
+        run_dir = date_dir / f"{next_idx:03d}_{time_tag}_{run_name}"
+        try:
+            run_dir.mkdir(parents=False, exist_ok=False)
+            break
+        except FileExistsError:
+            next_idx += 1
+    return str(run_dir / run_name)
+
+
+class MaMuJoCoEnv(BaseEnv):
+    """MaMuJoCo adapter so the ENODE pipeline can train on PettingZoo rollouts."""
 
     def __init__(
         self,
+        scenario: str,
+        agent_conf: str,
         dt: float,
         device,
         obs_noise: float,
@@ -38,6 +74,7 @@ class MaMuJoCoAnt2x4Env(BaseEnv):
         consensus_weight: float = 0.0,
         ac_rew_const: float = 0.01,
         num_env_workers: int = 1,
+        agent_obsk: int = 1,
     ):
         try:
             from gymnasium_robotics.envs.multiagent_mujoco import mamujoco_v1 as mamujoco
@@ -47,9 +84,9 @@ class MaMuJoCoAnt2x4Env(BaseEnv):
             ) from e
 
         self.mamujoco = mamujoco
-        self.scenario = "Ant"
-        self.agent_conf = "2x4"
-        self.agent_obsk = 1
+        self.scenario = scenario
+        self.agent_conf = agent_conf
+        self.agent_obsk = int(agent_obsk)
         self.consensus_weight = consensus_weight
         self.num_env_workers = max(1, int(num_env_workers))
         self.use_env_rewards = True
@@ -79,7 +116,7 @@ class MaMuJoCoAnt2x4Env(BaseEnv):
             m=m,
             act_rng=action_high,
             obs_trans=False,
-            name="mamujoco-ant2x4",
+            name=f"mamujoco-{self.scenario.lower()}-{self.agent_conf}",
             state_actions_names=names,
             device=device,
             solver=solver,
@@ -105,13 +142,16 @@ class MaMuJoCoAnt2x4Env(BaseEnv):
         self.mamujoco = mamujoco
 
     def _make_env(self):
-        return self.mamujoco.parallel_env(
-            scenario=self.scenario,
-            agent_conf=self.agent_conf,
-            agent_obsk=self.agent_obsk,
-            render_mode=None,
-            terminate_when_unhealthy=False,
-        )
+        kwargs = {
+            "scenario": self.scenario,
+            "agent_conf": self.agent_conf,
+            "agent_obsk": self.agent_obsk,
+            "render_mode": None,
+        }
+        # Avoid early-termination artifacts for environments that support this argument.
+        if self.scenario in {"Ant", "Walker2d", "Hopper", "Humanoid", "HumanoidStandup"}:
+            kwargs["terminate_when_unhealthy"] = False
+        return self.mamujoco.parallel_env(**kwargs)
 
     def _obs_dict_to_joint(self, obs_dict):
         return np.concatenate([np.asarray(obs_dict[a], dtype=np.float32) for a in self.agent_ids], axis=0)
@@ -358,7 +398,11 @@ class CooperativeCoupledEnv(BaseEnv):
 
 def build_args():
     p = argparse.ArgumentParser(description='Cooperative multi-agent ENODE runner (state-coupled).')
-    p.add_argument('--env', default='cartpole', choices=['pendulum', 'cartpole', 'acrobot', 'ant2x4'])
+    p.add_argument(
+        '--env',
+        default='cartpole',
+        choices=['pendulum', 'cartpole', 'acrobot', *MAMUJOCO_ENV_SPECS.keys()],
+    )
     p.add_argument('--n_agents', type=int, default=3)
     p.add_argument('--dt', type=float, default=0.1)
     p.add_argument('--noise', type=float, default=0.0)
@@ -405,7 +449,7 @@ def build_args():
     p.add_argument('--use_wandb', action='store_true')
     p.add_argument('--wandb_project', type=str, default='ma-ctrl')
     p.add_argument('--wandb_entity', type=str, default='')
-    p.add_argument('--wandb_group', type=str, default='ant2x4-enode')
+    p.add_argument('--wandb_group', type=str, default='mamujoco-enode')
     p.add_argument('--wandb_name', type=str, default='')
     p.add_argument('--wandb_mode', type=str, default='online', choices=['online', 'offline', 'disabled'])
     p.add_argument('--wandb_tags', type=str, default='enode,ctde,multi-agent')
@@ -423,8 +467,11 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    if args.env == 'ant2x4':
-        env = MaMuJoCoAnt2x4Env(
+    if args.env in MAMUJOCO_ENV_SPECS:
+        scenario, agent_conf = MAMUJOCO_ENV_SPECS[args.env]
+        env = MaMuJoCoEnv(
+            scenario=scenario,
+            agent_conf=agent_conf,
             dt=args.dt,
             device=device,
             obs_noise=args.noise,
@@ -515,6 +562,8 @@ def main():
         f"{ctrl.name}-ma{effective_agents}-k{args.coupling_strength:.2f}-"
         f"cw{args.consensus_weight:.2f}-seed{args.seed}"
     )
+    run_output_prefix = _make_indexed_output_prefix(run_name)
+    print(f"output_prefix={run_output_prefix}")
     runtime_device_info = {
         'runtime_device': str(device),
         'runtime_device_type': str(device.type),
@@ -593,10 +642,10 @@ def main():
         print("Note: reward model is not separated in this codebase; rew_lr is logged but not used.")
 
     try:
-        utils.plot_model(ctrl, D, L=args.L, H=args.h_train, rep_buf=min(10, D.N), fname=run_name + '-train.png')
-        utils.plot_test(ctrl, D, L=args.L, H=FIXED_EPISODE_SECONDS, N=min(5, max(3, D.N)), fname=run_name + '-test.png')
+        utils.plot_model(ctrl, D, L=args.L, H=args.h_train, rep_buf=min(10, D.N), fname=run_output_prefix + '-train.png')
+        utils.plot_test(ctrl, D, L=args.L, H=FIXED_EPISODE_SECONDS, N=min(5, max(3, D.N)), fname=run_output_prefix + '-test.png')
         utils.train_loop(
-            ctrl, D, run_name, rounds, L=args.L, H=args.h_train,
+            ctrl, D, run_output_prefix, rounds, L=args.L, H=args.h_train,
             policy_tau=policy_tau, actor_lr=args.actor_lr,
             critic_lr=args.critic_lr, soft_tau=args.soft_update_tau, dyn_lr=args.dyn_lr,
             dyn_grad_clip=args.dyn_grad_clip,

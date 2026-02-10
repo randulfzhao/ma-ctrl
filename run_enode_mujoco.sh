@@ -3,8 +3,8 @@ set -u
 
 # Explicit script list (ordered). Maintain this list manually.
 scripts=(
-  # "ant2x4_0.sh"
-  # "ant2x4_1.sh"
+  "ant2x4_0.sh"
+  "ant2x4_1.sh"
   "ant2x4d_0.sh"
   "ant2x4d_1.sh"
   "ant4x2_0.sh"

@@ -1,5 +1,7 @@
 import numpy as np
-import copy, math, os, collections, time
+import copy, math, os, collections, time, json, re
+from datetime import datetime
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import matplotlib.pyplot as plt
 plt.switch_backend('agg')
@@ -102,6 +104,58 @@ def _dataset_summary_metrics(D, prefix='train/dataset', start_idx=0):
         saturation = ((a <= lb + sat_tol) | (a >= ub - sat_tol)).float().mean()
         metrics[f'{prefix}/action_saturation_ratio'] = saturation
     return metrics
+
+
+def _sanitize_checkpoint_token(value):
+    token = str(value).strip()
+    token = re.sub(r'[^A-Za-z0-9._-]+', '-', token)
+    token = token.strip('-')
+    return token if token else 'na'
+
+
+def _save_best_checkpoint(
+    ctrl,
+    D,
+    checkpoint_dir,
+    run_timestamp,
+    seed,
+    algo_name,
+    env_name,
+    best_round,
+    best_eval_reward,
+):
+    ckpt_dir = Path(checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    seed_token = _sanitize_checkpoint_token(seed if seed is not None else 'na')
+    run_token = _sanitize_checkpoint_token(run_timestamp)
+    algo_token = _sanitize_checkpoint_token(algo_name)
+    env_token = _sanitize_checkpoint_token(env_name)
+    base_name = f'best_seed{seed_token}_run{run_token}_algo{algo_token}_env{env_token}'
+    ckpt_base = ckpt_dir / base_name
+    ctrl.save(D=D, fname=str(ckpt_base))
+
+    saved_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    seed_value = None
+    if seed is not None:
+        try:
+            seed_value = int(seed)
+        except Exception:
+            seed_value = str(seed)
+    metadata = {
+        'checkpoint_file': str(ckpt_base) + '.pkl',
+        'checkpoint_saved_at': saved_at,
+        'training_run_timestamp': str(run_timestamp),
+        'algorithm': str(algo_name),
+        'env_name': str(env_name),
+        'seed': seed_value,
+        'best_round': int(best_round),
+        'best_eval_true_reward': float(best_eval_reward),
+    }
+    meta_path = str(ckpt_base) + '.meta.json'
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, ensure_ascii=True, indent=2, sort_keys=True)
+    return str(ckpt_base) + '.pkl', meta_path
 
 ##########################################################################################
 ######################################## PLOTTING ########################################
@@ -253,9 +307,25 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
     eval_horizon_sec = float(kwargs.get('eval_horizon_sec', 2.5))
     use_window_cache = bool(kwargs.get('use_window_cache', True))
     dyn_window_steps = max(1, int(kwargs.get('dyn_window_steps', 5)))
+    save_best_checkpoint = bool(kwargs.get('save_best_checkpoint', True))
+    checkpoint_dir = kwargs.get('checkpoint_dir', 'checkpoint')
+    run_timestamp = kwargs.get('run_timestamp', datetime.now().strftime('%Y%m%d_%H%M%S'))
+    checkpoint_algo = kwargs.get('checkpoint_algo', getattr(ctrl, 'dynamics', 'unknown'))
+    checkpoint_env_name = kwargs.get('checkpoint_env_name', getattr(ctrl.env, 'name', 'unknown-env'))
+    checkpoint_seed = kwargs.get('seed', None)
+    best_eval_true_reward = -np.inf
+    best_eval_round = None
+    best_eval_checkpoint_path = None
+    best_eval_meta_path = None
     dyn_window_h = float(ctrl.env.dt * dyn_window_steps)
     dyn_tr_fnc = get_train_functions(ctrl.dynamics)
     print('fname is {:s}'.format(fname))
+    if save_best_checkpoint:
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        print(
+            f'Best-checkpoint tracking enabled: dir={checkpoint_dir}, '
+            f'run_ts={run_timestamp}, algo={checkpoint_algo}, env={checkpoint_env_name}, seed={checkpoint_seed}'
+        )
     # plot_model(ctrl, D, H=H, L=L, rep_buf=10, fname=fname+'-train.png')
     r0 = int( (D.N-ctrl.env.N0) / (1+ctrl.env.Nexpseq) )
     if use_window_cache and ctrl.is_cont:
@@ -367,6 +437,34 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
                 **_tensor_stats('eval/test_reward', test_rewards),
             },
         )
+        if save_best_checkpoint and np.isfinite(true_test_rewards) and true_test_rewards > best_eval_true_reward:
+            best_eval_true_reward = float(true_test_rewards)
+            best_eval_round = int(round)
+            best_eval_checkpoint_path, best_eval_meta_path = _save_best_checkpoint(
+                ctrl=ctrl,
+                D=D,
+                checkpoint_dir=checkpoint_dir,
+                run_timestamp=run_timestamp,
+                seed=checkpoint_seed,
+                algo_name=checkpoint_algo,
+                env_name=checkpoint_env_name,
+                best_round=best_eval_round,
+                best_eval_reward=best_eval_true_reward,
+            )
+            print(
+                '[best-checkpoint] updated: '
+                f'reward={best_eval_true_reward:.6f}, round={best_eval_round}, '
+                f'file={best_eval_checkpoint_path}, meta={best_eval_meta_path}'
+            )
+        if best_eval_round is not None:
+            _wandb_log(
+                wandb_run,
+                {
+                    'train/round': round,
+                    'train/best_eval_true_reward': best_eval_true_reward,
+                    'train/best_eval_round': int(best_eval_round),
+                },
+            )
         use_solved_threshold = getattr(ctrl.env, 'use_solved_threshold', True)
         solved = False
         if use_solved_threshold:

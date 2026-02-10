@@ -7,6 +7,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+import torch.nn as nn
 import numpy as np
 import random
 
@@ -21,6 +22,7 @@ if str(ODERL_DIR) not in sys.path:
 import envs
 import ctrl.ctrl as base
 from ctrl import utils
+from ctrl.policy import Policy
 from envs.base_env import BaseEnv
 
 FIXED_EPISODE_SECONDS = 2.5
@@ -35,6 +37,143 @@ MAMUJOCO_ENV_SPECS = {
     "swimmer": ("Swimmer", "2x1"),
     "swimmer2x1": ("Swimmer", "2x1"),
 }
+
+
+class LocalPolicyEnv:
+    """Minimal env spec used to initialize one independent actor per agent."""
+
+    def __init__(self, obs_dim: int, act_low: np.ndarray, act_high: np.ndarray, device):
+        self.n = int(obs_dim)
+        self.m = int(np.asarray(act_low).reshape(-1).shape[0])
+        act_low = np.asarray(act_low, dtype=np.float32).reshape(-1)
+        act_high = np.asarray(act_high, dtype=np.float32).reshape(-1)
+        max_abs = float(np.max(np.abs(np.concatenate([act_low, act_high]))))
+        self.act_rng = max(1e-6, max_abs)
+        self.ac_lb = torch.tensor(act_low, dtype=torch.float32, device=device)
+        self.ac_ub = torch.tensor(act_high, dtype=torch.float32, device=device)
+
+
+class AgentPolicyController(nn.Module):
+    """One decentralized actor controller for a single agent."""
+
+    def __init__(self, agent_idx: int, local_env: LocalPolicyEnv, nl_g: int, nn_g: int, act_g: str):
+        super().__init__()
+        self.agent_idx = int(agent_idx)
+        self.env = local_env
+        self._g = Policy(local_env, nl=nl_g, nn=nn_g, act=act_g)
+
+    def forward(self, s, t):
+        return self._g(s, t)
+
+
+class CTDEJointPolicy(nn.Module):
+    """Joint policy wrapper with independent per-agent actors (decentralized execution)."""
+
+    def __init__(self, env: BaseEnv, agent_ctrls: List[AgentPolicyController], obs_slices: List[slice], act_dims: List[int]):
+        super().__init__()
+        if len(agent_ctrls) != len(obs_slices):
+            raise ValueError("agent_ctrls and obs_slices length mismatch")
+        self.env = env
+        self.agent_ctrls = nn.ModuleList(agent_ctrls)
+        self.obs_slices = list(obs_slices)
+        self.act_dims = [int(d) for d in act_dims]
+        self.n_agents = len(agent_ctrls)
+
+    def forward(self, s, t):
+        acts = []
+        for i, agent_ctrl in enumerate(self.agent_ctrls):
+            si = s[..., self.obs_slices[i]]
+            ai = agent_ctrl(si, t)
+            if ai.shape[-1] != self.act_dims[i]:
+                raise RuntimeError(
+                    f"Agent {i} action dim mismatch: expected {self.act_dims[i]}, got {ai.shape[-1]}"
+                )
+            acts.append(ai)
+        return torch.cat(acts, dim=-1)
+
+
+def _infer_obs_dims(env: BaseEnv, n_agents: int) -> List[int]:
+    if hasattr(env, "obs_dim"):
+        return [int(getattr(env, "obs_dim"))] * n_agents
+    if hasattr(env, "n_i"):
+        return [int(getattr(env, "n_i"))] * n_agents
+    if int(env.n) % int(n_agents) != 0:
+        raise ValueError(f"Cannot evenly split state dim n={env.n} across n_agents={n_agents}.")
+    return [int(env.n) // int(n_agents)] * n_agents
+
+
+def _infer_action_specs(env: BaseEnv, n_agents: int):
+    if hasattr(env, "act_dims"):
+        act_dims = [int(d) for d in getattr(env, "act_dims")]
+    elif hasattr(env, "m_i"):
+        act_dims = [int(getattr(env, "m_i"))] * n_agents
+    else:
+        if int(env.m) % int(n_agents) != 0:
+            raise ValueError(f"Cannot evenly split action dim m={env.m} across n_agents={n_agents}.")
+        act_dims = [int(env.m) // int(n_agents)] * n_agents
+    if len(act_dims) != n_agents:
+        raise ValueError(f"Action dim list length {len(act_dims)} does not match n_agents={n_agents}.")
+    if int(sum(act_dims)) != int(env.m):
+        raise ValueError(f"Action dims sum {sum(act_dims)} does not match env.m={env.m}.")
+
+    if hasattr(env, "agent_action_lows") and hasattr(env, "agent_action_highs"):
+        lows = [np.asarray(x, dtype=np.float32).reshape(-1) for x in getattr(env, "agent_action_lows")]
+        highs = [np.asarray(x, dtype=np.float32).reshape(-1) for x in getattr(env, "agent_action_highs")]
+    else:
+        lb = env.ac_lb.detach().cpu().numpy().astype(np.float32).reshape(-1)
+        ub = env.ac_ub.detach().cpu().numpy().astype(np.float32).reshape(-1)
+        lows, highs = [], []
+        offset = 0
+        for d in act_dims:
+            lows.append(lb[offset : offset + d])
+            highs.append(ub[offset : offset + d])
+            offset += d
+    return act_dims, lows, highs
+
+
+def _build_obs_slices(obs_dims: List[int], total_n: int) -> List[slice]:
+    obs_slices = []
+    offset = 0
+    for d in obs_dims:
+        obs_slices.append(slice(offset, offset + int(d)))
+        offset += int(d)
+    if int(offset) != int(total_n):
+        raise ValueError(f"Obs dims sum {offset} does not match total_n={total_n}.")
+    return obs_slices
+
+
+def build_ctde_multi_controller_policy(
+    env: BaseEnv,
+    n_agents: int,
+    device,
+    nl_g: int,
+    nn_g: int,
+    act_g: str,
+):
+    obs_dims = _infer_obs_dims(env, n_agents)
+    obs_slices = _build_obs_slices(obs_dims, env.n)
+    act_dims, act_lows, act_highs = _infer_action_specs(env, n_agents)
+
+    agent_ctrls: List[AgentPolicyController] = []
+    for i in range(n_agents):
+        local_env = LocalPolicyEnv(
+            obs_dim=obs_dims[i],
+            act_low=act_lows[i],
+            act_high=act_highs[i],
+            device=device,
+        )
+        agent_ctrls.append(
+            AgentPolicyController(
+                agent_idx=i,
+                local_env=local_env,
+                nl_g=int(nl_g),
+                nn_g=int(nn_g),
+                act_g=str(act_g),
+            )
+        )
+
+    joint_policy = CTDEJointPolicy(env, agent_ctrls, obs_slices=obs_slices, act_dims=act_dims).to(device)
+    return joint_policy, agent_ctrls, obs_dims, act_dims
 
 
 def _make_indexed_output_prefix(run_name: str) -> str:
@@ -560,6 +699,25 @@ def main():
     ).to(device)
     # Use user-selected ODE solver for model rollouts; adaptive solvers can OOM in long backprop traces.
     ctrl.set_solver(args.solver)
+    ctde_multi_controller = False
+    ctde_obs_dims = []
+    ctde_act_dims = []
+    if effective_agents >= 1:
+        joint_policy, agent_ctrls, ctde_obs_dims, ctde_act_dims = build_ctde_multi_controller_policy(
+            env=env,
+            n_agents=effective_agents,
+            device=device,
+            nl_g=ctrl.kwargs['nl_g'],
+            nn_g=ctrl.kwargs['nn_g'],
+            act_g=ctrl.kwargs['act_g'],
+        )
+        ctrl._g = joint_policy
+        ctrl = ctrl.to(device)
+        ctde_multi_controller = True
+        print(
+            f"CTDE decentralized actors enabled: controllers={len(agent_ctrls)} "
+            f"obs_dims={ctde_obs_dims} act_dims={ctde_act_dims}"
+        )
 
     print(
         f'Env={env.name}, agents={effective_agents}, dt={env.dt:.3f}, '
@@ -576,11 +734,14 @@ def main():
     policy_tau = float(-args.dt / np.log(max(min(args.discount_rho, 1.0 - 1e-8), 1e-8)))
 
     run_name = (
-        f"{ctrl.name}-ma{effective_agents}-k{args.coupling_strength:.2f}-"
+        f"{ctrl.name}-ma{effective_agents}-ctde{int(ctde_multi_controller)}-k{args.coupling_strength:.2f}-"
         f"cw{args.consensus_weight:.2f}-seed{args.seed}"
     )
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_dir = ROOT / "checkpoint"
     run_output_prefix = _make_indexed_output_prefix(run_name)
     print(f"output_prefix={run_output_prefix}")
+    print(f"best_checkpoint_dir={checkpoint_dir}")
     runtime_device_info = {
         'runtime_device': str(device),
         'runtime_device_type': str(device.type),
@@ -636,6 +797,9 @@ def main():
                 'effective_agents': effective_agents,
                 'env_name': env.name,
                 'run_name': run_name,
+                'ctde_multi_controller': int(ctde_multi_controller),
+                'ctde_obs_dims': ctde_obs_dims,
+                'ctde_act_dims': ctde_act_dims,
                 **runtime_device_info,
             },
             allow_val_change=True,
@@ -676,6 +840,12 @@ def main():
             use_env_rewards=getattr(env, 'use_env_rewards', False),
             policy_batch_size=args.policy_batch_size, critic_updates=args.critic_updates,
             eval_horizon_sec=FIXED_EPISODE_SECONDS,
+            save_best_checkpoint=True,
+            checkpoint_dir=str(checkpoint_dir),
+            run_timestamp=run_timestamp,
+            checkpoint_algo=ctrl.dynamics,
+            checkpoint_env_name=env.name,
+            seed=args.seed,
             wandb_run=wandb_run
         )
     finally:

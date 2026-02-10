@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 GPU_ID=7
 SEEDS=(113 114)

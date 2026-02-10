@@ -97,19 +97,28 @@ class MaMuJoCoEnv(BaseEnv):
         obs, _ = env.reset(seed=0)
         self.agent_ids = list(env.agents)
         self.n_agents = len(self.agent_ids)
-        self.obs_dim = int(np.asarray(obs[self.agent_ids[0]]).shape[0])
+        self.agent_obs_dims = [int(np.asarray(obs[a]).shape[0]) for a in self.agent_ids]
+        # Some MaMuJoCo configs (e.g., HalfCheetah-6x1) have heterogeneous local
+        # observation sizes across agents. Pad shorter vectors to keep a stable joint
+        # state shape compatible with the rest of the ENODE pipeline.
+        self.obs_dim = int(max(self.agent_obs_dims))
         self.act_dims = [int(np.prod(env.action_space(a).shape)) for a in self.agent_ids]
         self.m_i = self.act_dims[0]
         self.n_i = self.obs_dim
         action_high = float(np.max(np.abs(env.action_space(self.agent_ids[0]).high)))
         self.agent_action_lows = [np.asarray(env.action_space(a).low, dtype=np.float32) for a in self.agent_ids]
         self.agent_action_highs = [np.asarray(env.action_space(a).high, dtype=np.float32) for a in self.agent_ids]
+        if len(set(self.agent_obs_dims)) > 1:
+            print(
+                f"[MaMuJoCoEnv] heterogeneous obs dims {self.agent_obs_dims}; "
+                f"padding to {self.obs_dim} per agent."
+            )
         env.close()
 
         n = self.n_agents * self.obs_dim
         m = int(sum(self.act_dims))
         names = [f"agent{i}.obs{j}" for i in range(self.n_agents) for j in range(self.obs_dim)]
-        names += [f"agent{i}.act{j}" for i in range(self.n_agents) for j in range(self.m_i)]
+        names += [f"agent{i}.act{j}" for i, d in enumerate(self.act_dims) for j in range(d)]
         super().__init__(
             dt=dt,
             n=n,
@@ -154,7 +163,15 @@ class MaMuJoCoEnv(BaseEnv):
         return self.mamujoco.parallel_env(**kwargs)
 
     def _obs_dict_to_joint(self, obs_dict):
-        return np.concatenate([np.asarray(obs_dict[a], dtype=np.float32) for a in self.agent_ids], axis=0)
+        parts = []
+        for aid in self.agent_ids:
+            obs = np.asarray(obs_dict[aid], dtype=np.float32).reshape(-1)
+            if obs.shape[0] < self.obs_dim:
+                obs = np.pad(obs, (0, self.obs_dim - obs.shape[0]), mode='constant')
+            elif obs.shape[0] > self.obs_dim:
+                obs = obs[:self.obs_dim]
+            parts.append(obs)
+        return np.concatenate(parts, axis=0)
 
     def _split_joint_action(self, joint_action):
         acts = {}

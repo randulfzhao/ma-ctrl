@@ -1,0 +1,10 @@
+{
+  "algorithm": "enode",
+  "best_eval_true_reward": -3.264132022857666,
+  "best_round": 21,
+  "checkpoint_file": "/data/zhaorunz/ma-ctrl/checkpoint/best_seed111_run20260210_181317_algoenode_envmamujoco-halfcheetah-6x1.pkl",
+  "checkpoint_saved_at": "2026-02-10 18:43:59",
+  "env_name": "mamujoco-halfcheetah-6x1",
+  "seed": 111,
+  "training_run_timestamp": "20260210_181317"
+}

@@ -1,0 +1,10 @@
+{
+  "algorithm": "enode",
+  "best_eval_true_reward": 26.82501220703125,
+  "best_round": 27,
+  "checkpoint_file": "/data/zhaorunz/ma-ctrl/checkpoint/best_seed111_run20260210_181316_algoenode_envmamujoco-swimmer-2x1.pkl",
+  "checkpoint_saved_at": "2026-02-10 18:45:07",
+  "env_name": "mamujoco-swimmer-2x1",
+  "seed": 111,
+  "training_run_timestamp": "20260210_181316"
+}

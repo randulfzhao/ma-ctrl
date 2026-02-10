@@ -1,0 +1,10 @@
+{
+  "algorithm": "enode",
+  "best_eval_true_reward": 31.8303165435791,
+  "best_round": 17,
+  "checkpoint_file": "/data/zhaorunz/ma-ctrl/checkpoint/best_seed111_run20260210_181316_algoenode_envmamujoco-ant-2x4d.pkl",
+  "checkpoint_saved_at": "2026-02-10 18:41:00",
+  "env_name": "mamujoco-ant-2x4d",
+  "seed": 111,
+  "training_run_timestamp": "20260210_181316"
+}

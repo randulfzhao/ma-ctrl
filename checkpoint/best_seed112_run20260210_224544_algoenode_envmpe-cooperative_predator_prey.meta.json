@@ -1,0 +1,10 @@
+{
+  "algorithm": "enode",
+  "best_eval_true_reward": 18.0,
+  "best_round": 9,
+  "checkpoint_file": "/data/zhaorunz/ma-ctrl/checkpoint/best_seed112_run20260210_224544_algoenode_envmpe-cooperative_predator_prey.pkl",
+  "checkpoint_saved_at": "2026-02-10 22:50:38",
+  "env_name": "mpe-cooperative_predator_prey",
+  "seed": 112,
+  "training_run_timestamp": "20260210_224544"
+}

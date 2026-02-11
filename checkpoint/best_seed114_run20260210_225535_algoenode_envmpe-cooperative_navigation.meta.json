@@ -1,0 +1,10 @@
+{
+  "algorithm": "enode",
+  "best_eval_true_reward": -44.70189666748047,
+  "best_round": 65,
+  "checkpoint_file": "/data/zhaorunz/ma-ctrl/checkpoint/best_seed114_run20260210_225535_algoenode_envmpe-cooperative_navigation.pkl",
+  "checkpoint_saved_at": "2026-02-10 23:27:55",
+  "env_name": "mpe-cooperative_navigation",
+  "seed": 114,
+  "training_run_timestamp": "20260210_225535"
+}

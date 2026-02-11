@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+GPU_ID=6
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"

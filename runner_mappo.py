@@ -277,7 +277,9 @@ def _build_policy_inference_fn(policy: R_MAPPOPolicy, env, args):
 
 def evaluate_with_runner_strategy(env, policy: R_MAPPOPolicy, args) -> Dict[str, float]:
     Ttest = max(1, int(np.round(float(FIXED_EPISODE_SECONDS) / float(env.dt))))
-    Ntest = max(1, int(args.eval_episodes))
+    # Keep parity with ENODE runner: eval/true_reward is averaged over 10 test seeds.
+    Ntest = 10
+    eval_seeds = [int(args.seed) + i for i in range(Ntest)]
     eval_env_workers = max(1, int(args.eval_env_workers))
 
     if args.algorithm_name == "rmappo" and eval_env_workers > 1:
@@ -292,38 +294,62 @@ def evaluate_with_runner_strategy(env, policy: R_MAPPOPolicy, args) -> Dict[str,
         env.num_env_workers = eval_env_workers
 
     try:
-        s0 = []
-        for _ in range(Ntest):
-            s0.append(torch.tensor(env.reset(), dtype=torch.float32, device=env.device))
-        s0 = torch.stack(s0, dim=0)
-
         policy_fn = _build_policy_inference_fn(policy, env, args)
         if hasattr(policy_fn, "reset_state"):
             policy_fn.reset_state()
 
         eval_t0 = time.perf_counter()
         with torch.no_grad():
-            _, _, test_rewards, _ = env.integrate_system(T=Ttest, s0=s0, g=policy_fn)
+            _, _, test_rewards, _ = env.integrate_system(T=Ttest, N=Ntest, g=policy_fn, reset_seeds=eval_seeds)
         eval_dt = time.perf_counter() - eval_t0
 
         rewards_are_accumulated = bool(getattr(env, "rewards_are_accumulated", False))
-        Tup = 0
+        test_rewards = test_rewards.detach().to(torch.float32)
+        if test_rewards.ndim == 1:
+            test_rewards = test_rewards.unsqueeze(0)
+        elif test_rewards.ndim > 2:
+            test_rewards = test_rewards.reshape(test_rewards.shape[0], -1)
+
         if rewards_are_accumulated:
-            reward_tensor = test_rewards[..., -1]
-            true_reward = reward_tensor.mean().item()
-            min_reward = reward_tensor.min().item()
+            cumulative_rewards = test_rewards
+            step_rewards = torch.diff(
+                cumulative_rewards,
+                dim=-1,
+                prepend=torch.zeros(
+                    (cumulative_rewards.shape[0], 1),
+                    dtype=cumulative_rewards.dtype,
+                    device=cumulative_rewards.device,
+                ),
+            )
         else:
-            reward_tensor = test_rewards[..., Tup:]
-            true_reward = reward_tensor.mean().item()
-            min_reward = reward_tensor.min().item()
-        solved_ratio = (reward_tensor >= 0.8).float().mean().item()
+            step_rewards = test_rewards
+            cumulative_rewards = torch.cumsum(step_rewards, dim=-1)
+
+        final_reward_tensor = cumulative_rewards[..., -1]
+        mid_idx = int(max(0, (cumulative_rewards.shape[-1] - 1) // 2))
+        midterm_reward_tensor = cumulative_rewards[..., mid_idx]
+
+        true_reward = final_reward_tensor.mean().item()
+        min_reward = final_reward_tensor.min().item()
+        solved_ratio = (final_reward_tensor >= 0.8).float().mean().item()
 
         metrics = {
             "eval/true_reward": float(true_reward),
             "eval/min_reward": float(min_reward),
             "eval/solved_ratio": float(solved_ratio),
+            "eval/midterm_reward": float(midterm_reward_tensor.mean().item()),
+            "eval/midterm_min_reward": float(midterm_reward_tensor.min().item()),
+            "eval/episodes": int(Ntest),
+            "eval/episode_length_steps": int(cumulative_rewards.shape[-1]),
+            "eval/midterm_step": int(mid_idx + 1),
+            "eval/rewards_are_accumulated": int(rewards_are_accumulated),
+            "eval/seed_start": int(eval_seeds[0]),
+            "eval/seed_end": int(eval_seeds[-1]),
             "eval/time_sec": float(eval_dt),
         }
+        metrics.update(_tensor_stats("eval/test_seed_return", final_reward_tensor))
+        metrics.update(_tensor_stats("eval/cumulative_reward", cumulative_rewards))
+        metrics.update(_tensor_stats("eval/step_reward", step_rewards))
         metrics.update(_tensor_stats("eval/test_reward", test_rewards))
         return metrics
     finally:
@@ -360,7 +386,12 @@ def build_args():
         help="Thread pool size for parallel worker.step in rollout. 0 means n_rollout_threads.",
     )
     p.add_argument("--eval_every_episodes", type=int, default=100)
-    p.add_argument("--eval_episodes", type=int, default=10)
+    p.add_argument(
+        "--eval_episodes",
+        type=int,
+        default=10,
+        help="Reserved for compatibility. Eval/true_reward uses a fixed 10 test seeds for ENODE parity.",
+    )
     p.add_argument(
         "--eval_env_workers",
         type=int,
@@ -813,8 +844,10 @@ def main():
                 print(
                     f"Eval @ episode={eval_ep_mark}: "
                     f"true_reward={eval_metrics['eval/true_reward']:.4f}, "
+                    f"midterm_reward={eval_metrics['eval/midterm_reward']:.4f}, "
                     f"min_reward={eval_metrics['eval/min_reward']:.4f}, "
-                    f"solved_ratio={eval_metrics['eval/solved_ratio']:.4f}"
+                    f"solved_ratio={eval_metrics['eval/solved_ratio']:.4f}, "
+                    f"seed_range=[{int(eval_metrics['eval/seed_start'])}, {int(eval_metrics['eval/seed_end'])}]"
                 )
 
                 if np.isfinite(eval_metrics["eval/true_reward"]) and eval_metrics["eval/true_reward"] > best_eval_reward:

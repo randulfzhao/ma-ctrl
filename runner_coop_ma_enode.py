@@ -379,16 +379,27 @@ class MaMuJoCoEnv(BaseEnv):
     def diff_ac_reward_(self, a):
         return -self.ac_rew_const * torch.sum(a**2, dim=-1)
 
-    def integrate_system(self, T, g, s0=None, N=1, return_states=False):
+    def integrate_system(self, T, g, s0=None, N=1, return_states=False, reset_seeds=None):
         with torch.no_grad():
             if s0 is not None:
                 N = int(s0.shape[0])
+            if reset_seeds is None:
+                episode_seeds = [None] * int(N)
+            else:
+                episode_seeds = [int(seed) for seed in reset_seeds]
+                if len(episode_seeds) != int(N):
+                    raise ValueError(
+                        f"reset_seeds length mismatch: expected {int(N)}, got {len(episode_seeds)}"
+                    )
             ts_single = self.dt * torch.arange(T, dtype=torch.float32, device=self.device)
             sts, ats, rts = [], [], []
 
-            def _rollout_one_episode():
+            def _rollout_one_episode(reset_seed=None):
                 env = self._make_env()
-                obs, _ = env.reset()
+                if reset_seed is None:
+                    obs, _ = env.reset()
+                else:
+                    obs, _ = env.reset(seed=int(reset_seed))
                 st_ep, at_ep, rt_ep = [], [], []
                 ep_return = 0.0
                 for t_idx in range(T):
@@ -419,10 +430,10 @@ class MaMuJoCoEnv(BaseEnv):
 
             workers = max(1, min(self.num_env_workers, N))
             if workers == 1:
-                rollouts = [_rollout_one_episode() for _ in range(N)]
+                rollouts = [_rollout_one_episode(episode_seeds[i]) for i in range(N)]
             else:
                 with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = [executor.submit(_rollout_one_episode) for _ in range(N)]
+                    futures = [executor.submit(_rollout_one_episode, episode_seeds[i]) for i in range(N)]
                     rollouts = [f.result() for f in futures]
 
             for st_ep, at_ep, rt_ep in rollouts:
@@ -667,18 +678,30 @@ class MPECooperativeEnv(BaseEnv):
     def diff_ac_reward_(self, a):
         return -self.ac_rew_const * torch.sum(a**2, dim=-1)
 
-    def integrate_system(self, T, g, s0=None, N=1, return_states=False):
+    def integrate_system(self, T, g, s0=None, N=1, return_states=False, reset_seeds=None):
         with torch.no_grad():
             T = int(T)
             if s0 is not None:
                 N = int(s0.shape[0])
             N = max(1, int(N))
+            if reset_seeds is None:
+                episode_seeds = [None] * int(N)
+            else:
+                episode_seeds = [int(seed) for seed in reset_seeds]
+                if len(episode_seeds) != int(N):
+                    raise ValueError(
+                        f"reset_seeds length mismatch: expected {int(N)}, got {len(episode_seeds)}"
+                    )
             ts_single = self.dt * torch.arange(T, dtype=torch.float32, device=self.device)
 
             envs = [self._make_env() for _ in range(N)]
             obs_dicts = []
-            for env in envs:
-                obs, _ = env.reset()
+            for i, env in enumerate(envs):
+                seed_i = episode_seeds[i]
+                if seed_i is None:
+                    obs, _ = env.reset()
+                else:
+                    obs, _ = env.reset(seed=int(seed_i))
                 obs_dicts.append(obs)
             alive = [True] * N
             ep_returns = [0.0] * N

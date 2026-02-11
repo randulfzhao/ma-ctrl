@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 
-GPU_ID=1
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
+GPU_ID=3
 SEEDS=(113 114)
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 mkdir -p logs
 
 for SEED in "${SEEDS[@]}"; do
   python runner_coop_ma_enode.py \
-    --env ant2x4 \
+    --env cooperative_predator_prey \
     --rounds 100 \
-    --dt 0.05 \
+    --dt 0.1 \
     --solver rk4 \
     --h_data 2.5 \
     --h_train 2.5 \
@@ -17,7 +20,7 @@ for SEED in "${SEEDS[@]}"; do
     --n_ens 5 \
     --consensus_weight 0.02 \
     --device "cuda:${GPU_ID}" \
-    --episode_length 50 \
+    --episode_length 25 \
     --replay_buffer_size 20 \
     --dyn_max_episodes 20 \
     --discount_rho 0.95 \
@@ -42,10 +45,10 @@ for SEED in "${SEEDS[@]}"; do
     --seed "${SEED}" \
     --use_wandb \
     --wandb_project ma-ctrl \
-    --wandb_group ant2x4-enode \
-    --wandb_name "ant2x4-enode-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
+    --wandb_group cooperative-predator-prey-enode \
+    --wandb_name "cooperative-predator-prey-enode-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
     --wandb_mode online \
-    --wandb_tags enode,ant2x4 \
+    --wandb_tags enode,mpe,cooperative_predator_prey \
     --wandb_entity "" \
-    2>&1 | tee "logs/ant2x4_enode_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
+    2>&1 | tee "logs/cooperative_predator_prey_enode_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
 done

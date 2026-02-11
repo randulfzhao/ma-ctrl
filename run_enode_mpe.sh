@@ -7,18 +7,10 @@ cd "${ROOT_DIR}"
 
 # Explicit script list (ordered). Maintain this list manually.
 scripts=(
-  "ant2x4_0.sh"
-  "ant2x4_1.sh"
-  "ant2x4d_0.sh"
-  "ant2x4d_1.sh"
-  "ant4x2_0.sh"
-  "ant4x2_1.sh"
-  "cheetah6x1_0.sh"
-  "cheetah6x1_1.sh"
-  "swimmer_0.sh"
-  "swimmer_1.sh"
-  "walker_0.sh"
-  "walker_1.sh"
+  "cooperative_predator_prey_0.sh"
+  "cooperative_predator_prey_1.sh"
+  "cooperative_navigation_0.sh"
+  "cooperative_navigation_1.sh"
 )
 
 if [[ ${#scripts[@]} -eq 0 ]]; then

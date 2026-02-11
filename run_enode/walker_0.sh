@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
-GPU_ID=7
-SEEDS=(113 114)
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
+GPU_ID=2
+SEEDS=(111 112)
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 mkdir -p logs
 
 for SEED in "${SEEDS[@]}"; do
   python runner_coop_ma_enode.py \
-    --env cheetah6x1 \
+    --env walker \
     --rounds 100 \
     --dt 0.05 \
     --solver rk4 \
@@ -43,10 +45,10 @@ for SEED in "${SEEDS[@]}"; do
     --seed "${SEED}" \
     --use_wandb \
     --wandb_project ma-ctrl \
-    --wandb_group cheetah6x1-enode \
-    --wandb_name "cheetah6x1-enode-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
+    --wandb_group walker-enode \
+    --wandb_name "walker-enode-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
     --wandb_mode online \
-    --wandb_tags enode,cheetah6x1 \
+    --wandb_tags enode,walker \
     --wandb_entity "" \
-    2>&1 | tee "logs/cheetah6x1_enode_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
+    2>&1 | tee "logs/walker_enode_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
 done

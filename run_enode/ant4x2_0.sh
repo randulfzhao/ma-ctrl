@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
 GPU_ID=4
 SEEDS=(111 112)
 RUN_TS="$(date +%Y%m%d_%H%M%S)"

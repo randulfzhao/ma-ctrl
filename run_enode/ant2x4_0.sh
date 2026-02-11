@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 
-GPU_ID=1
-SEEDS=(113 114)
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
+GPU_ID=0
+SEEDS=(111 112)
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 mkdir -p logs
 
 for SEED in "${SEEDS[@]}"; do
   python runner_coop_ma_enode.py \
-    --env swimmer \
+    --env ant2x4 \
     --rounds 100 \
     --dt 0.05 \
     --solver rk4 \
@@ -42,10 +45,10 @@ for SEED in "${SEEDS[@]}"; do
     --seed "${SEED}" \
     --use_wandb \
     --wandb_project ma-ctrl \
-    --wandb_group swimmer-enode \
-    --wandb_name "swimmer-enode-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
+    --wandb_group ant2x4-enode \
+    --wandb_name "ant2x4-enode-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
     --wandb_mode online \
-    --wandb_tags enode,swimmer \
+    --wandb_tags enode,ant2x4 \
     --wandb_entity "" \
-    2>&1 | tee "logs/swimmer_enode_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
+    2>&1 | tee "logs/ant2x4_enode_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
 done

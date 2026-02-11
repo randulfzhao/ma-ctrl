@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
 GPU_ID=0
 SEEDS=(111 112)
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
@@ -7,9 +10,9 @@ mkdir -p logs
 
 for SEED in "${SEEDS[@]}"; do
   python runner_coop_ma_enode.py \
-    --env swimmer \
+    --env cooperative_navigation \
     --rounds 100 \
-    --dt 0.05 \
+    --dt 0.1 \
     --solver rk4 \
     --h_data 2.5 \
     --h_train 2.5 \
@@ -17,7 +20,7 @@ for SEED in "${SEEDS[@]}"; do
     --n_ens 5 \
     --consensus_weight 0.02 \
     --device "cuda:${GPU_ID}" \
-    --episode_length 50 \
+    --episode_length 25 \
     --replay_buffer_size 20 \
     --dyn_max_episodes 20 \
     --discount_rho 0.95 \
@@ -42,10 +45,10 @@ for SEED in "${SEEDS[@]}"; do
     --seed "${SEED}" \
     --use_wandb \
     --wandb_project ma-ctrl \
-    --wandb_group swimmer-enode \
-    --wandb_name "swimmer-enode-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
+    --wandb_group cooperative-navigation-enode \
+    --wandb_name "cooperative-navigation-enode-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
     --wandb_mode online \
-    --wandb_tags enode,swimmer \
+    --wandb_tags enode,mpe,cooperative_navigation \
     --wandb_entity "" \
-    2>&1 | tee "logs/swimmer_enode_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
+    2>&1 | tee "logs/cooperative_navigation_enode_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
 done

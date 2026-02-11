@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 
-GPU_ID=2
-SEEDS=(111 112)
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
+GPU_ID=3
+SEEDS=(113 114)
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 mkdir -p logs
 

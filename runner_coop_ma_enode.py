@@ -1,6 +1,6 @@
 import os
 import argparse
-from typing import List
+from typing import List, Dict
 from pathlib import Path
 from datetime import datetime
 import sys
@@ -36,6 +36,34 @@ MAMUJOCO_ENV_SPECS = {
     "cheetah6x1": ("HalfCheetah", "6x1"),
     "swimmer": ("Swimmer", "2x1"),
     "swimmer2x1": ("Swimmer", "2x1"),
+}
+MPE_ENV_SPECS: Dict[str, Dict[str, object]] = {
+    "cooperative_navigation": {
+        "scenario": "simple_spread_v3",
+        "kwargs": {
+            "N": 3,
+            "local_ratio": 0.0,
+        },
+        "controlled_role": "all",
+    },
+    "cooperative_predator_prey": {
+        "scenario": "simple_tag_v3",
+        "kwargs": {
+            "num_good": 1,
+            "num_adversaries": 3,
+            "num_obstacles": 2,
+        },
+        "controlled_role": "adversary",
+    },
+}
+MPE_ENV_ALIASES = {
+    "cooperative_navigation": "cooperative_navigation",
+    "coop_navigation": "cooperative_navigation",
+    "navigation": "cooperative_navigation",
+    "cooperative_predator_prey": "cooperative_predator_prey",
+    "coop_predator_prey": "cooperative_predator_prey",
+    "predator_prey": "cooperative_predator_prey",
+    "cooperative_predactor_pray": "cooperative_predator_prey",
 }
 
 
@@ -424,6 +452,306 @@ class MaMuJoCoEnv(BaseEnv):
         return None
 
 
+class MPECooperativeEnv(BaseEnv):
+    """PettingZoo MPE adapter for cooperative_navigation and cooperative_predator_prey."""
+
+    def __init__(
+        self,
+        mpe_env_key: str,
+        dt: float,
+        device,
+        obs_noise: float,
+        ts_grid: str,
+        solver: str,
+        consensus_weight: float = 0.0,
+        ac_rew_const: float = 0.01,
+        num_env_workers: int = 1,
+    ):
+        canonical_key = MPE_ENV_ALIASES.get(str(mpe_env_key), str(mpe_env_key))
+        if canonical_key not in MPE_ENV_SPECS:
+            raise ValueError(f"Unsupported MPE env key: {mpe_env_key}")
+        self.mpe_env_key = canonical_key
+        self.consensus_weight = float(consensus_weight)
+        self.num_env_workers = max(1, int(num_env_workers))
+        self.use_env_rewards = True
+        self.rewards_are_accumulated = True
+        self.use_solved_threshold = False
+        self.max_cycles = max(1, int(np.round(FIXED_EPISODE_SECONDS / dt)))
+
+        spec = MPE_ENV_SPECS[self.mpe_env_key]
+        self.mpe_scenario = str(spec["scenario"])
+        self.mpe_kwargs = dict(spec.get("kwargs", {}))
+        self.controlled_role = str(spec.get("controlled_role", "all"))
+        self.continuous_actions = True
+
+        env = self._make_env()
+        obs, _ = env.reset(seed=0)
+        self.all_agent_ids = list(env.agents)
+        if self.controlled_role == "adversary":
+            self.agent_ids = [aid for aid in self.all_agent_ids if aid.startswith("adversary_")]
+            if len(self.agent_ids) == 0:
+                raise RuntimeError("Expected adversary agents but none were found.")
+        else:
+            self.agent_ids = list(self.all_agent_ids)
+        self.reward_agent_ids = list(self.agent_ids)
+        self.n_agents = len(self.agent_ids)
+        self.agent_obs_dims = [int(np.asarray(obs[aid]).reshape(-1).shape[0]) for aid in self.agent_ids]
+        self.obs_dim = int(max(self.agent_obs_dims))
+
+        self.act_dims = []
+        self.agent_action_lows = []
+        self.agent_action_highs = []
+        for aid in self.agent_ids:
+            space = env.action_space(aid)
+            if hasattr(space, "shape") and space.shape is not None and int(np.prod(space.shape)) > 0:
+                d = int(np.prod(space.shape))
+                low = np.asarray(space.low, dtype=np.float32).reshape(-1)
+                high = np.asarray(space.high, dtype=np.float32).reshape(-1)
+            elif hasattr(space, "n"):
+                d = int(space.n)
+                low = np.zeros((d,), dtype=np.float32)
+                high = np.ones((d,), dtype=np.float32)
+            else:
+                raise TypeError(f"Unsupported action space for agent {aid}: {space}")
+            self.act_dims.append(d)
+            self.agent_action_lows.append(low)
+            self.agent_action_highs.append(high)
+        env.close()
+
+        if len(set(self.agent_obs_dims)) > 1:
+            print(
+                f"[MPECooperativeEnv] heterogeneous obs dims {self.agent_obs_dims}; "
+                f"padding to {self.obs_dim} per agent."
+            )
+
+        self.n_i = self.obs_dim
+        self.m_i = self.act_dims[0]
+        self.joint_action_low = np.concatenate(self.agent_action_lows, axis=0).astype(np.float32)
+        self.joint_action_high = np.concatenate(self.agent_action_highs, axis=0).astype(np.float32)
+        action_high = float(np.max(np.abs(np.concatenate([self.joint_action_low, self.joint_action_high], axis=0))))
+
+        n = self.n_agents * self.obs_dim
+        m = int(sum(self.act_dims))
+        names = [f"agent{i}.obs{j}" for i in range(self.n_agents) for j in range(self.obs_dim)]
+        names += [f"agent{i}.act{j}" for i, d in enumerate(self.act_dims) for j in range(d)]
+        super().__init__(
+            dt=dt,
+            n=n,
+            m=m,
+            act_rng=action_high,
+            obs_trans=False,
+            name=f"mpe-{self.mpe_env_key}",
+            state_actions_names=names,
+            device=device,
+            solver=solver,
+            obs_noise=obs_noise,
+            ts_grid=ts_grid,
+            ac_rew_const=ac_rew_const,
+            vel_rew_const=0.0,
+        )
+        # Use true action bounds from MPE spaces (e.g. [0,1] for continuous MPE).
+        self.ac_lb = torch.tensor(self.joint_action_low, dtype=torch.float32, device=device)
+        self.ac_ub = torch.tensor(self.joint_action_high, dtype=torch.float32, device=device)
+        self.N0 = 10
+        self.Nexpseq = 2
+        self.reward_range = [-10.0, 10.0]
+        self.reset()
+
+    def _make_env(self):
+        kwargs = dict(self.mpe_kwargs)
+        kwargs.update(
+            {
+                "max_cycles": int(self.max_cycles),
+                "continuous_actions": bool(self.continuous_actions),
+                "render_mode": None,
+            }
+        )
+        if self.mpe_scenario == "simple_spread_v3":
+            try:
+                from mpe2 import simple_spread_v3
+            except Exception:
+                from pettingzoo.mpe import simple_spread_v3
+
+            return simple_spread_v3.parallel_env(**kwargs)
+        if self.mpe_scenario == "simple_tag_v3":
+            try:
+                from mpe2 import simple_tag_v3
+            except Exception:
+                from pettingzoo.mpe import simple_tag_v3
+
+            return simple_tag_v3.parallel_env(**kwargs)
+        raise ValueError(f"Unsupported MPE scenario: {self.mpe_scenario}")
+
+    def _obs_dict_to_joint(self, obs_dict):
+        parts = []
+        for i, aid in enumerate(self.agent_ids):
+            default_dim = self.agent_obs_dims[i]
+            raw_obs = obs_dict.get(aid, np.zeros((default_dim,), dtype=np.float32))
+            obs = np.asarray(raw_obs, dtype=np.float32).reshape(-1)
+            if obs.shape[0] < self.obs_dim:
+                obs = np.pad(obs, (0, self.obs_dim - obs.shape[0]), mode="constant")
+            elif obs.shape[0] > self.obs_dim:
+                obs = obs[: self.obs_dim]
+            parts.append(obs)
+        return np.concatenate(parts, axis=0)
+
+    def _default_env_action(self, action_space):
+        if hasattr(action_space, "shape") and action_space.shape is not None and int(np.prod(action_space.shape)) > 0:
+            zeros = np.zeros(action_space.shape, dtype=np.float32)
+            if hasattr(action_space, "low") and hasattr(action_space, "high"):
+                zeros = np.clip(zeros, action_space.low, action_space.high)
+            return zeros.astype(np.float32)
+        if hasattr(action_space, "n"):
+            return 0
+        raise TypeError(f"Unsupported action space type: {action_space}")
+
+    def _build_action_dict(self, joint_action: np.ndarray, env):
+        joint_action = np.asarray(joint_action, dtype=np.float32).reshape(-1)
+        if joint_action.shape[0] != self.m:
+            raise RuntimeError(f"Joint action dim mismatch: expected {self.m}, got {joint_action.shape[0]}")
+        clipped_joint = np.clip(joint_action, self.joint_action_low, self.joint_action_high).astype(np.float32)
+        actions = {}
+        active_agents = set(env.agents)
+        offset = 0
+        for i, aid in enumerate(self.agent_ids):
+            d = self.act_dims[i]
+            local_act = clipped_joint[offset : offset + d]
+            offset += d
+            if aid not in active_agents:
+                continue
+            space = env.action_space(aid)
+            if hasattr(space, "n"):
+                actions[aid] = int(np.argmax(local_act))
+            else:
+                actions[aid] = local_act
+        for aid in env.agents:
+            if aid not in actions:
+                actions[aid] = self._default_env_action(env.action_space(aid))
+        return actions, clipped_joint
+
+    def _team_reward(self, rewards: dict) -> float:
+        reward_keys = [aid for aid in self.reward_agent_ids if aid in rewards]
+        if len(reward_keys) == 0:
+            reward_keys = list(rewards.keys())
+        if len(reward_keys) == 0:
+            return 0.0
+        reward_vec = np.asarray([rewards[k] for k in reward_keys], dtype=np.float32)
+        if reward_vec.shape[0] == 1 or np.allclose(reward_vec, reward_vec[0], atol=1e-6):
+            return float(reward_vec[0])
+        return float(reward_vec.mean())
+
+    def torch_transform_states(self, state):
+        return state
+
+    def obs2state(self, state):
+        return state
+
+    def reset(self):
+        env = self._make_env()
+        obs, _ = env.reset()
+        self.state = self._obs_dict_to_joint(obs)
+        env.close()
+        return self.state.copy()
+
+    def torch_rhs(self, state, action):
+        # True rhs is unknown for black-box environment stepping.
+        return torch.zeros_like(state)
+
+    def diff_obs_reward_(self, s):
+        sj = s.reshape(*s.shape[:-1], self.n_agents, self.obs_dim)
+        centered = sj - sj.mean(dim=-2, keepdim=True)
+        disagreement = (centered**2).mean(dim=(-1, -2))
+        state_pen = 1e-3 * (sj**2).mean(dim=(-1, -2))
+        return -self.consensus_weight * disagreement - state_pen
+
+    def diff_ac_reward_(self, a):
+        return -self.ac_rew_const * torch.sum(a**2, dim=-1)
+
+    def integrate_system(self, T, g, s0=None, N=1, return_states=False):
+        with torch.no_grad():
+            T = int(T)
+            if s0 is not None:
+                N = int(s0.shape[0])
+            N = max(1, int(N))
+            ts_single = self.dt * torch.arange(T, dtype=torch.float32, device=self.device)
+
+            envs = [self._make_env() for _ in range(N)]
+            obs_dicts = []
+            for env in envs:
+                obs, _ = env.reset()
+                obs_dicts.append(obs)
+            alive = [True] * N
+            ep_returns = [0.0] * N
+            sts = []
+            ats = []
+            rts = []
+
+            for t_idx in range(T):
+                obs_batch_np = np.stack([self._obs_dict_to_joint(obs_dicts[i]) for i in range(N)], axis=0)
+                obs_batch = torch.tensor(obs_batch_np, dtype=torch.float32, device=self.device)
+                t_tensor = ts_single[t_idx]
+                action_batch = g(obs_batch, t_tensor)
+                if isinstance(action_batch, np.ndarray):
+                    action_batch_np = np.asarray(action_batch, dtype=np.float32)
+                else:
+                    action_batch_np = action_batch.detach().cpu().numpy().astype(np.float32)
+                if action_batch_np.ndim == 1:
+                    action_batch_np = action_batch_np.reshape(1, -1)
+                if action_batch_np.shape[0] != N:
+                    if action_batch_np.shape[0] == 1:
+                        action_batch_np = np.repeat(action_batch_np, N, axis=0)
+                    else:
+                        raise RuntimeError(
+                            f"Policy batch dim mismatch: expected {N}, got {action_batch_np.shape[0]}"
+                        )
+                if action_batch_np.shape[1] != self.m:
+                    raise RuntimeError(
+                        f"Policy action dim mismatch: expected {self.m}, got {action_batch_np.shape[1]}"
+                    )
+
+                step_actions = []
+                step_rewards = []
+                for i, env in enumerate(envs):
+                    if not alive[i]:
+                        step_actions.append(torch.zeros(self.m, dtype=torch.float32))
+                        step_rewards.append(ep_returns[i])
+                        continue
+                    env_actions, clipped_joint = self._build_action_dict(action_batch_np[i], env)
+                    next_obs, rewards, terms, truncs, _ = env.step(env_actions)
+                    team_reward = self._team_reward(rewards)
+                    ep_returns[i] += float(team_reward)
+                    step_rewards.append(ep_returns[i])
+                    step_actions.append(torch.tensor(clipped_joint, dtype=torch.float32))
+                    done = (
+                        len(env.agents) == 0
+                        or (len(terms) > 0 and all(terms.values()))
+                        or (len(truncs) > 0 and all(truncs.values()))
+                    )
+                    if done:
+                        alive[i] = False
+                    else:
+                        obs_dicts[i] = next_obs
+
+                sts.append(torch.tensor(obs_batch_np, dtype=torch.float32))
+                ats.append(torch.stack(step_actions))
+                rts.append(torch.tensor(step_rewards, dtype=torch.float32))
+
+            for env in envs:
+                env.close()
+
+            st = torch.stack(sts, dim=1).to(self.device)
+            at = torch.stack(ats, dim=1).to(self.device)
+            rt = torch.stack(rts, dim=1).to(self.device)
+            ts = torch.stack([ts_single] * N)
+            returns = [st, at, rt, ts]
+            if return_states:
+                returns.append(st)
+            return returns
+
+    def render(self, mode='human', **kwargs):
+        return None
+
+
 class CooperativeCoupledEnv(BaseEnv):
     """Cooperative multi-agent wrapper with state coupling.
 
@@ -557,7 +885,7 @@ def build_args():
     p.add_argument(
         '--env',
         default='cartpole',
-        choices=['pendulum', 'cartpole', 'acrobot', *MAMUJOCO_ENV_SPECS.keys()],
+        choices=['pendulum', 'cartpole', 'acrobot', *MAMUJOCO_ENV_SPECS.keys(), *MPE_ENV_ALIASES.keys()],
     )
     p.add_argument('--n_agents', type=int, default=3)
     p.add_argument('--dt', type=float, default=0.1)
@@ -628,6 +956,17 @@ def main():
         env = MaMuJoCoEnv(
             scenario=scenario,
             agent_conf=agent_conf,
+            dt=args.dt,
+            device=device,
+            obs_noise=args.noise,
+            ts_grid=args.ts_grid,
+            solver=args.solver,
+            consensus_weight=args.consensus_weight,
+            num_env_workers=args.collect_parallel_workers,
+        )
+    elif args.env in MPE_ENV_ALIASES:
+        env = MPECooperativeEnv(
+            mpe_env_key=args.env,
             dt=args.dt,
             device=device,
             obs_noise=args.noise,

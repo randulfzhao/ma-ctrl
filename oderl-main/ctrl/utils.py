@@ -1030,7 +1030,8 @@ def obtain_smooth_test_acts(env, T, sf=1.0, ell=0.5, eps=1e-5):
     with torch.no_grad():
         t = torch.arange(T,device=env.device) * env.dt
         acs = draw_from_gp(t, sf, ell, n_out=env.m, eps=eps).to(torch.float32)
-        acs = acs * (env.ac_ub-env.ac_lb)/2 # T,m
+        act_mid = (env.ac_ub + env.ac_lb) / 2.0
+        acs = act_mid + acs * (env.ac_ub-env.ac_lb)/2 # T,m
         return _clip_actions(env,acs) # T,m
 
 def get_kernel_interpolation(env, T, N=1, ell=0.25, sf=0.5):
@@ -1053,7 +1054,8 @@ def build_policy(env, T, g_pol=None, sf=0.1, ell=0.5, N=1):
     def g(s,t):
         a_pol = g_pol(s,t) if g_pol is not None else 0.0
         a_exp = g_exp(s,t)
-        return tanh_(a_pol+a_exp) * (env.ac_ub-env.ac_lb) / 2.0
+        act_mid = (env.ac_ub + env.ac_lb) / 2.0
+        return act_mid + tanh_(a_pol+a_exp) * (env.ac_ub-env.ac_lb) / 2.0
     return g
 
 def collect_data(env, H, N=1, sf=0.5, ell=0.5, D=None):

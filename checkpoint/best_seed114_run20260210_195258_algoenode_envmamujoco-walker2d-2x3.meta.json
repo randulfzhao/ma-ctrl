@@ -1,0 +1,10 @@
+{
+  "algorithm": "enode",
+  "best_eval_true_reward": 58.799171447753906,
+  "best_round": 25,
+  "checkpoint_file": "/data/zhaorunz/ma-ctrl/checkpoint/best_seed114_run20260210_195258_algoenode_envmamujoco-walker2d-2x3.pkl",
+  "checkpoint_saved_at": "2026-02-10 20:26:08",
+  "env_name": "mamujoco-walker2d-2x3",
+  "seed": 114,
+  "training_run_timestamp": "20260210_195258"
+}

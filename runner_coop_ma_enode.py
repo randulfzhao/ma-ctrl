@@ -412,8 +412,14 @@ class MaMuJoCoEnv(BaseEnv):
                     else:
                         joint_action = action.detach().reshape(-1).cpu().numpy().astype(np.float32)
                     act_dict = self._split_joint_action(joint_action)
+                    clipped_joint = np.concatenate(
+                        [np.asarray(act_dict[aid], dtype=np.float32).reshape(-1) for aid in self.agent_ids],
+                        axis=0,
+                    )
                     st_ep.append(joint_obs.squeeze(0).cpu())
-                    at_ep.append(torch.tensor(joint_action, dtype=torch.float32))
+                    # Record the action actually executed in env (post-clipping),
+                    # keeping action semantics consistent with MPE rollouts.
+                    at_ep.append(torch.tensor(clipped_joint, dtype=torch.float32))
                     obs, rewards, terms, truncs, _ = env.step(act_dict)
                     reward_vec = np.asarray([rewards[a] for a in self.agent_ids], dtype=np.float32)
                     if np.allclose(reward_vec, reward_vec[0], atol=1e-6):
@@ -1102,7 +1108,9 @@ def main():
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     checkpoint_dir = ROOT / "checkpoint"
     run_output_prefix = _make_indexed_output_prefix(run_name)
+    eval_metrics_path = run_output_prefix + "-eval.jsonl"
     print(f"output_prefix={run_output_prefix}")
+    print(f"eval_metrics_path={eval_metrics_path}")
     print(f"best_checkpoint_dir={checkpoint_dir}")
     runtime_device_info = {
         'runtime_device': str(device),
@@ -1202,6 +1210,7 @@ def main():
             use_env_rewards=getattr(env, 'use_env_rewards', False),
             policy_batch_size=args.policy_batch_size, critic_updates=args.critic_updates,
             eval_horizon_sec=FIXED_EPISODE_SECONDS,
+            eval_metrics_path=eval_metrics_path,
             save_best_checkpoint=True,
             checkpoint_dir=str(checkpoint_dir),
             run_timestamp=run_timestamp,

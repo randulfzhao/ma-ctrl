@@ -34,6 +34,28 @@ def _wandb_log(wandb_run, metrics, step=None):
         wandb_run.log(clean, step=step)
 
 
+def _append_jsonl(path, metrics):
+    if path is None or str(path) == '':
+        return
+    clean = {}
+    for key, value in metrics.items():
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                continue
+            value = value.item()
+        elif isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            clean[key] = value
+    if len(clean) == 0:
+        return
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open('a', encoding='utf-8') as f:
+        json.dump(clean, f, ensure_ascii=True, sort_keys=True)
+        f.write('\n')
+
+
 def _tensor_stats(prefix, tensor, quantiles=(0.05, 0.5, 0.95), max_elems=200000):
     if tensor is None:
         return {}
@@ -304,6 +326,7 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
     policy_batch_size = kwargs.get('policy_batch_size', 256)
     critic_updates = kwargs.get('critic_updates', 4)
     wandb_run = kwargs.get('wandb_run', None)
+    eval_metrics_path = kwargs.get('eval_metrics_path', None)
     eval_horizon_sec = float(kwargs.get('eval_horizon_sec', 2.5))
     use_window_cache = bool(kwargs.get('use_window_cache', True))
     dyn_window_steps = max(1, int(kwargs.get('dyn_window_steps', 5)))
@@ -401,18 +424,34 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
         Htest, Ntest = eval_horizon_sec, 10
         Ttest = max(1, int(np.round(Htest / ctrl.env.dt)))
         Tup = 0
-        s0 = torch.stack([numpy_to_torch(ctrl.env.reset()) for _ in range(Ntest)]).to(ctrl.device) 
-        _,_,test_rewards,_ = ctrl.env.integrate_system(T=Ttest, s0=s0, g=ctrl._g)
-        # Evaluate over a fixed episode window.
-        rewards_are_accumulated = getattr(ctrl.env, 'rewards_are_accumulated', False)
-        if rewards_are_accumulated:
-            true_test_rewards = test_rewards[..., -1].mean().item()
-            min_test_reward = test_rewards[..., -1].min().item()
+        eval_seed_base = kwargs.get('eval_seed_base', checkpoint_seed)
+        eval_seeds = None if eval_seed_base is None else [int(eval_seed_base) + i for i in range(Ntest)]
+        s0 = torch.stack([numpy_to_torch(ctrl.env.reset()) for _ in range(Ntest)]).to(ctrl.device)
+        integrate_kwargs = {'T': Ttest, 's0': s0, 'g': ctrl._g}
+        st_eval = None
+        if eval_seeds is not None:
+            try:
+                integrate_kwargs['reset_seeds'] = eval_seeds
+                st_eval, _, test_rewards, _ = ctrl.env.integrate_system(**integrate_kwargs)
+            except TypeError:
+                integrate_kwargs.pop('reset_seeds', None)
+                st_eval, _, test_rewards, _ = ctrl.env.integrate_system(**integrate_kwargs)
+                eval_seeds = None
         else:
-            true_test_rewards = test_rewards[...,Tup:].mean().item()
-            min_test_reward = test_rewards[...,Tup:].min().item()
-        st_hat, rt_hat, at_hat, t = ctrl.forward_simulate(Htest, s0, ctrl._g, compute_rew=True, record_actions=True)
-        rt_hat = ctrl.env.diff_obs_reward_(st_hat[:,:,:-1])
+            st_eval, _, test_rewards, _ = ctrl.env.integrate_system(**integrate_kwargs)
+
+        # Keep reward semantics consistent across environments:
+        # eval/true_reward is always the mean episode return across Ntest episodes.
+        rewards_are_accumulated = getattr(ctrl.env, 'rewards_are_accumulated', False)
+        step_test_rewards = _step_rewards_from_dataset_rewards(test_rewards, rewards_are_accumulated)
+        cumulative_test_rewards = test_rewards if rewards_are_accumulated else torch.cumsum(step_test_rewards, dim=-1)
+        episode_returns = cumulative_test_rewards[..., -1]
+        true_test_rewards = episode_returns.mean().item()
+        min_test_reward = episode_returns.min().item()
+
+        s0_eval = st_eval[:, 0, :]
+        st_hat, rt_hat, at_hat, t = ctrl.forward_simulate(Htest, s0_eval, ctrl._g, compute_rew=True, record_actions=True)
+        rt_hat = ctrl.env.diff_obs_reward_(st_hat[:, :, :-1])
         imagined_test_rewards = rt_hat[..., Tup:].mean().item()
         imagined_min_reward = rt_hat[..., Tup:].min().item()
         reward_gap = true_test_rewards - imagined_test_rewards
@@ -420,23 +459,31 @@ def train_loop(ctrl, D, fname, Nround, **kwargs):
               format(true_test_rewards,imagined_test_rewards))
         print(f'Minimum test reward is {min_test_reward}')
         eval_dt = time.perf_counter() - eval_t0
-        solved_tensor = test_rewards[..., -1] if rewards_are_accumulated else test_rewards[...,Tup:]
+        solved_tensor = episode_returns
         solved_ratio = (solved_tensor >= .8).float().mean().item()
-        _wandb_log(
-            wandb_run,
-            {
-                'eval/round': round,
-                'eval/true_reward': true_test_rewards,
-                'eval/model_reward': imagined_test_rewards,
-                'eval/model_min_reward': imagined_min_reward,
-                'eval/min_reward': min_test_reward,
-                'eval/reward_gap': reward_gap,
-                'eval/abs_reward_gap': abs(reward_gap),
-                'eval/solved_ratio': solved_ratio,
-                'eval/time_sec': eval_dt,
-                **_tensor_stats('eval/test_reward', test_rewards),
-            },
-        )
+        eval_metrics = {
+            'eval/round': round,
+            'eval/true_reward': true_test_rewards,
+            'eval/model_reward': imagined_test_rewards,
+            'eval/model_min_reward': imagined_min_reward,
+            'eval/min_reward': min_test_reward,
+            'eval/reward_gap': reward_gap,
+            'eval/abs_reward_gap': abs(reward_gap),
+            'eval/solved_ratio': solved_ratio,
+            'eval/time_sec': eval_dt,
+            'eval/episodes': int(Ntest),
+            'eval/rewards_are_accumulated': int(rewards_are_accumulated),
+            **_tensor_stats('eval/test_reward', test_rewards),
+            **_tensor_stats('eval/test_seed_return', episode_returns),
+            **_tensor_stats('eval/cumulative_reward', cumulative_test_rewards),
+            **_tensor_stats('eval/step_reward', step_test_rewards),
+        }
+        if eval_seeds is not None and len(eval_seeds) > 0:
+            eval_metrics['eval/seed_start'] = int(eval_seeds[0])
+            eval_metrics['eval/seed_end'] = int(eval_seeds[-1])
+        print(f"eval/true_reward={true_test_rewards:.6f}")
+        _append_jsonl(eval_metrics_path, eval_metrics)
+        _wandb_log(wandb_run, eval_metrics)
         if save_best_checkpoint and np.isfinite(true_test_rewards) and true_test_rewards > best_eval_true_reward:
             best_eval_true_reward = float(true_test_rewards)
             best_eval_round = int(round)

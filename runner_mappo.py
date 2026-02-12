@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import random
 import socket
@@ -8,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -23,7 +24,7 @@ if str(ONPOLICY_DIR) not in sys.path:
 
 from onpolicy.algorithms.r_mappo.algorithm.rMAPPOPolicy import R_MAPPOPolicy
 from onpolicy.algorithms.r_mappo.r_mappo import R_MAPPO
-from onpolicy.utils.shared_buffer import SharedReplayBuffer
+from onpolicy.utils.separated_buffer import SeparatedReplayBuffer
 
 from runner_coop_ma_enode import (
     FIXED_EPISODE_SECONDS,
@@ -62,6 +63,28 @@ def _wandb_log(wandb_run, metrics: Dict[str, object], step: int = None) -> None:
         wandb_run.log(clean)
     else:
         wandb_run.log(clean, step=step)
+
+
+def _append_jsonl(path: str, metrics: Dict[str, object]) -> None:
+    if path is None or str(path) == "":
+        return
+    clean: Dict[str, object] = {}
+    for key, value in metrics.items():
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                continue
+            value = value.item()
+        elif isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            clean[key] = value
+    if len(clean) == 0:
+        return
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("a", encoding="utf-8") as f:
+        json.dump(clean, f, ensure_ascii=True, sort_keys=True)
+        f.write("\n")
 
 
 def _to_scalar(value) -> float:
@@ -176,14 +199,115 @@ def _build_share_obs(obs: np.ndarray) -> np.ndarray:
     return np.repeat(flat[:, None, :], n_agents, axis=1).astype(np.float32)
 
 
-def _build_policy_inference_fn(policy: R_MAPPOPolicy, env, args):
+def _build_share_obs_flat(obs: np.ndarray) -> np.ndarray:
+    # obs: [n_rollout_threads, n_agents, obs_dim]
+    return obs.reshape(obs.shape[0], -1).astype(np.float32)
+
+
+def _build_policy_inference_fn(policy_or_policies: Union[R_MAPPOPolicy, Sequence[R_MAPPOPolicy]], env, args):
     num_agents = int(env.n_agents)
     obs_dim = int(env.obs_dim)
+    act_dims = [int(d) for d in env.act_dims]
     recurrent_N = int(args.recurrent_N)
     hidden_size = int(args.hidden_size)
     use_recurrent = bool(
         getattr(args, "use_recurrent_policy", False) or getattr(args, "use_naive_recurrent_policy", False)
     )
+
+    if isinstance(policy_or_policies, (list, tuple)):
+        policies = list(policy_or_policies)
+        if len(policies) != num_agents:
+            raise ValueError(
+                f"Expected one policy per agent (num_agents={num_agents}), got len(policies)={len(policies)}."
+            )
+
+        rnn_states = None
+        masks = None
+        batch_cache = None
+        last_t = None
+
+        def _init_eval_states(batch_size: int):
+            states = [
+                np.zeros((batch_size, recurrent_N, hidden_size), dtype=np.float32)
+                for _ in range(num_agents)
+            ]
+            mask = [np.ones((batch_size, 1), dtype=np.float32) for _ in range(num_agents)]
+            return states, mask
+
+        def reset_state():
+            nonlocal rnn_states, masks, batch_cache, last_t
+            rnn_states = None
+            masks = None
+            batch_cache = None
+            last_t = None
+
+        def _to_time_scalar(t):
+            if isinstance(t, torch.Tensor):
+                if t.numel() == 0:
+                    return None
+                return float(t.detach().reshape(-1)[0].item())
+            try:
+                return float(t)
+            except Exception:
+                return None
+
+        def g(s, t):
+            nonlocal rnn_states, masks, batch_cache, last_t
+
+            if isinstance(s, torch.Tensor):
+                s_np = s.detach().cpu().numpy().astype(np.float32)
+                out_device = s.device
+                out_dtype = s.dtype
+            else:
+                s_np = np.asarray(s, dtype=np.float32)
+                out_device = torch.device(args.device)
+                out_dtype = torch.float32
+
+            if s_np.ndim == 1:
+                s_np = s_np.reshape(1, -1)
+            batch = int(s_np.shape[0])
+            t_scalar = _to_time_scalar(t)
+
+            if use_recurrent:
+                is_new_episode = False
+                if t_scalar is not None and last_t is not None:
+                    if (t_scalar <= 1e-8 and last_t > 1e-8) or (t_scalar < last_t - 1e-8):
+                        is_new_episode = True
+                if (rnn_states is None) or (batch_cache != batch) or is_new_episode:
+                    rnn_states, masks = _init_eval_states(batch)
+                    batch_cache = batch
+                rnn_states_in = rnn_states
+                masks_in = masks
+            else:
+                rnn_states_in, masks_in = _init_eval_states(batch)
+
+            obs_agents = s_np.reshape(batch, num_agents, obs_dim)
+            actions_parts = []
+            next_rnn_states = []
+            with torch.no_grad():
+                for aid, policy in enumerate(policies):
+                    actions_t, rnn_states_t = policy.act(
+                        obs_agents[:, aid, :],
+                        rnn_states_in[aid],
+                        masks_in[aid],
+                        available_actions=None,
+                        deterministic=True,
+                    )
+                    actions_i = _t2n(actions_t).reshape(batch, -1).astype(np.float32)
+                    actions_parts.append(actions_i[:, : act_dims[aid]])
+                    if use_recurrent:
+                        next_rnn_states.append(_t2n(rnn_states_t).astype(np.float32))
+            if use_recurrent:
+                rnn_states = next_rnn_states
+                last_t = t_scalar
+
+            joint_actions = np.concatenate(actions_parts, axis=1).astype(np.float32)
+            return torch.as_tensor(joint_actions, dtype=out_dtype, device=out_device)
+
+        g.reset_state = reset_state
+        return g
+
+    policy = policy_or_policies
 
     rnn_states = None
     masks = None
@@ -264,7 +388,7 @@ def _build_policy_inference_fn(policy: R_MAPPOPolicy, env, args):
         joint_actions = []
         for b in range(batch):
             parts = []
-            for aid, d in enumerate(env.act_dims):
+            for aid, d in enumerate(act_dims):
                 parts.append(actions[b, aid, : int(d)])
             joint_actions.append(np.concatenate(parts, axis=0))
         joint_actions = np.stack(joint_actions, axis=0).astype(np.float32)
@@ -275,7 +399,9 @@ def _build_policy_inference_fn(policy: R_MAPPOPolicy, env, args):
     return g
 
 
-def evaluate_with_runner_strategy(env, policy: R_MAPPOPolicy, args) -> Dict[str, float]:
+def evaluate_with_runner_strategy(
+    env, policy_or_policies: Union[R_MAPPOPolicy, Sequence[R_MAPPOPolicy]], args
+) -> Dict[str, float]:
     Ttest = max(1, int(np.round(float(FIXED_EPISODE_SECONDS) / float(env.dt))))
     # Keep parity with ENODE runner: eval/true_reward is averaged over 10 test seeds.
     Ntest = 10
@@ -294,7 +420,7 @@ def evaluate_with_runner_strategy(env, policy: R_MAPPOPolicy, args) -> Dict[str,
         env.num_env_workers = eval_env_workers
 
     try:
-        policy_fn = _build_policy_inference_fn(policy, env, args)
+        policy_fn = _build_policy_inference_fn(policy_or_policies, env, args)
         if hasattr(policy_fn, "reset_state"):
             policy_fn.reset_state()
 
@@ -497,36 +623,48 @@ def _build_env(args, device):
     obs_dim = int(env.obs_dim)
 
     act_dims = [int(d) for d in env.act_dims]
-    if len(set(act_dims)) != 1:
-        raise ValueError(
-            f"MAPPO shared policy requires homogeneous action dims across agents, got {act_dims}."
-        )
-    act_dim = int(act_dims[0])
 
     obs_space = Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
     share_obs_space = Box(low=-np.inf, high=np.inf, shape=(int(env.n),), dtype=np.float32)
 
-    low = np.asarray(env.agent_action_lows[0], dtype=np.float32).reshape(-1)
-    high = np.asarray(env.agent_action_highs[0], dtype=np.float32).reshape(-1)
-    if low.shape[0] != act_dim or high.shape[0] != act_dim:
-        raise RuntimeError(
-            f"Action bound shape mismatch: low={low.shape}, high={high.shape}, act_dim={act_dim}"
-        )
-    act_space = Box(low=low, high=high, shape=(act_dim,), dtype=np.float32)
+    act_spaces = []
+    for aid, act_dim in enumerate(act_dims):
+        low = np.asarray(env.agent_action_lows[aid], dtype=np.float32).reshape(-1)
+        high = np.asarray(env.agent_action_highs[aid], dtype=np.float32).reshape(-1)
+        if low.shape[0] != act_dim or high.shape[0] != act_dim:
+            raise RuntimeError(
+                f"Action bound shape mismatch for agent {aid}: "
+                f"low={low.shape}, high={high.shape}, act_dim={act_dim}"
+            )
+        act_spaces.append(Box(low=low, high=high, shape=(act_dim,), dtype=np.float32))
 
-    return env, env_kind, n_agents, obs_space, share_obs_space, act_space
+    return env, env_kind, n_agents, obs_space, share_obs_space, act_spaces
 
 
 def _init_workers(env, env_kind: str, n_rollout_threads: int) -> List[MAPPOEpisodeWorker]:
     return [MAPPOEpisodeWorker(env, env_kind=env_kind, worker_id=i) for i in range(int(n_rollout_threads))]
 
 
-def _save_checkpoint(policy: R_MAPPOPolicy, checkpoint_prefix: str) -> Tuple[str, str]:
+def _save_checkpoint(
+    policy_or_policies: Union[R_MAPPOPolicy, Sequence[R_MAPPOPolicy]], checkpoint_prefix: str
+) -> Tuple[List[str], List[str]]:
+    if isinstance(policy_or_policies, (list, tuple)):
+        actor_paths: List[str] = []
+        critic_paths: List[str] = []
+        for aid, policy in enumerate(policy_or_policies):
+            actor_path = f"{checkpoint_prefix}_agent{aid}_actor.pt"
+            critic_path = f"{checkpoint_prefix}_agent{aid}_critic.pt"
+            torch.save(policy.actor.state_dict(), actor_path)
+            torch.save(policy.critic.state_dict(), critic_path)
+            actor_paths.append(actor_path)
+            critic_paths.append(critic_path)
+        return actor_paths, critic_paths
+
     actor_path = checkpoint_prefix + "_actor.pt"
     critic_path = checkpoint_prefix + "_critic.pt"
-    torch.save(policy.actor.state_dict(), actor_path)
-    torch.save(policy.critic.state_dict(), critic_path)
-    return actor_path, critic_path
+    torch.save(policy_or_policies.actor.state_dict(), actor_path)
+    torch.save(policy_or_policies.critic.state_dict(), critic_path)
+    return [actor_path], [critic_path]
 
 
 def main():
@@ -570,22 +708,33 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    env, env_kind, num_agents, obs_space, share_obs_space, act_space = _build_env(args, device)
+    env, env_kind, num_agents, obs_space, share_obs_space, act_spaces = _build_env(args, device)
+    act_dims = [int(d) for d in env.act_dims]
+    max_act_dim = int(max(act_dims))
 
     run_name = f"{env.name}-{args.algorithm_name}-ma{num_agents}-seed{args.seed}"
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_output_prefix = _make_indexed_output_prefix(run_name)
+    eval_metrics_path = run_output_prefix + "-eval.jsonl"
     checkpoint_dir = ROOT / "checkpoint"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Env={env.name}, env_kind={env_kind}, agents={num_agents}, dt={env.dt:.3f}, ep_len={args.episode_length}")
     print(f"output_prefix={run_output_prefix}")
+    print(f"eval_metrics_path={eval_metrics_path}")
     print(f"checkpoint_dir={checkpoint_dir}")
 
     policy_args = SimpleNamespace(**vars(args))
-    policy = R_MAPPOPolicy(policy_args, obs_space, share_obs_space, act_space, device=device)
-    trainer = R_MAPPO(policy_args, policy, device=device)
-    buffer = SharedReplayBuffer(policy_args, num_agents, obs_space, share_obs_space, act_space)
+    policies: List[R_MAPPOPolicy] = []
+    trainers: List[R_MAPPO] = []
+    buffers: List[SeparatedReplayBuffer] = []
+    for aid in range(num_agents):
+        policy_i = R_MAPPOPolicy(policy_args, obs_space, share_obs_space, act_spaces[aid], device=device)
+        trainer_i = R_MAPPO(policy_args, policy_i, device=device)
+        buffer_i = SeparatedReplayBuffer(policy_args, obs_space, share_obs_space, act_spaces[aid])
+        policies.append(policy_i)
+        trainers.append(trainer_i)
+        buffers.append(buffer_i)
 
     if args.use_wandb:
         try:
@@ -664,17 +813,23 @@ def main():
     try:
         for update in range(updates):
             if args.use_linear_lr_decay:
-                policy.lr_decay(update, max(1, updates))
+                for policy in policies:
+                    policy.lr_decay(update, max(1, updates))
 
             obs = np.zeros((args.n_rollout_threads, num_agents, int(env.obs_dim)), dtype=np.float32)
             for wid, worker in enumerate(workers):
                 rollout_seed = args.seed + update * 10000 + wid * 100
                 obs[wid] = worker.reset(seed=rollout_seed)
 
-            share_obs = _build_share_obs(obs)
-            buffer.step = 0
-            buffer.share_obs[0] = share_obs.copy()
-            buffer.obs[0] = obs.copy()
+            share_obs = _build_share_obs_flat(obs)
+            for aid, buffer in enumerate(buffers):
+                buffer.step = 0
+                buffer.share_obs[0] = share_obs.copy()
+                buffer.obs[0] = obs[:, aid, :].copy()
+                buffer.rnn_states[0].fill(0.0)
+                buffer.rnn_states_critic[0].fill(0.0)
+                buffer.masks[0].fill(1.0)
+                buffer.active_masks[0].fill(1.0)
 
             rnn_states = np.zeros(
                 (args.n_rollout_threads, num_agents, args.recurrent_N, args.hidden_size),
@@ -689,32 +844,33 @@ def main():
 
             rollout_t0 = time.perf_counter()
             for step in range(args.episode_length):
-                trainer.prep_rollout()
+                for trainer in trainers:
+                    trainer.prep_rollout()
 
                 with torch.no_grad():
-                    values_t, actions_t, action_log_probs_t, rnn_states_t, rnn_states_critic_t = policy.get_actions(
-                        share_obs.reshape(-1, share_obs.shape[-1]),
-                        obs.reshape(-1, obs.shape[-1]),
-                        rnn_states.reshape(-1, args.recurrent_N, args.hidden_size),
-                        rnn_states_critic.reshape(-1, args.recurrent_N, args.hidden_size),
-                        masks.reshape(-1, 1),
-                    )
+                    values_by_agent: List[np.ndarray] = []
+                    actions_by_agent: List[np.ndarray] = []
+                    action_log_probs_by_agent: List[np.ndarray] = []
+                    rnn_states_next = np.zeros_like(rnn_states)
+                    rnn_states_critic_next = np.zeros_like(rnn_states_critic)
 
-                values = _t2n(values_t).reshape(args.n_rollout_threads, num_agents, -1).astype(np.float32)
-                actions = _t2n(actions_t).reshape(args.n_rollout_threads, num_agents, -1).astype(np.float32)
-                action_log_probs = (
-                    _t2n(action_log_probs_t).reshape(args.n_rollout_threads, num_agents, -1).astype(np.float32)
-                )
-                rnn_states_next = (
-                    _t2n(rnn_states_t)
-                    .reshape(args.n_rollout_threads, num_agents, args.recurrent_N, args.hidden_size)
-                    .astype(np.float32)
-                )
-                rnn_states_critic_next = (
-                    _t2n(rnn_states_critic_t)
-                    .reshape(args.n_rollout_threads, num_agents, args.recurrent_N, args.hidden_size)
-                    .astype(np.float32)
-                )
+                    for aid, policy in enumerate(policies):
+                        values_t, actions_t, action_log_probs_t, rnn_states_t, rnn_states_critic_t = policy.get_actions(
+                            share_obs,
+                            obs[:, aid, :],
+                            rnn_states[:, aid, :, :],
+                            rnn_states_critic[:, aid, :, :],
+                            masks[:, aid, :],
+                        )
+                        values_by_agent.append(_t2n(values_t).astype(np.float32))
+                        actions_by_agent.append(_t2n(actions_t).astype(np.float32))
+                        action_log_probs_by_agent.append(_t2n(action_log_probs_t).astype(np.float32))
+                        rnn_states_next[:, aid, :, :] = _t2n(rnn_states_t).astype(np.float32)
+                        rnn_states_critic_next[:, aid, :, :] = _t2n(rnn_states_critic_t).astype(np.float32)
+
+                actions = np.zeros((args.n_rollout_threads, num_agents, max_act_dim), dtype=np.float32)
+                for aid, act_dim in enumerate(act_dims):
+                    actions[:, aid, :act_dim] = actions_by_agent[aid][:, :act_dim]
 
                 rewards = np.zeros((args.n_rollout_threads, num_agents, 1), dtype=np.float32)
                 dones = np.zeros((args.n_rollout_threads, num_agents), dtype=bool)
@@ -756,20 +912,21 @@ def main():
                 active_masks_next = np.ones_like(masks_next)
                 active_masks_next[dones == True] = 0.0
 
-                share_obs_next = _build_share_obs(next_obs)
+                share_obs_next = _build_share_obs_flat(next_obs)
 
-                buffer.insert(
-                    share_obs_next,
-                    next_obs,
-                    rnn_states_next,
-                    rnn_states_critic_next,
-                    actions,
-                    action_log_probs,
-                    values,
-                    rewards,
-                    masks_next,
-                    active_masks=active_masks_next,
-                )
+                for aid, buffer in enumerate(buffers):
+                    buffer.insert(
+                        share_obs_next,
+                        next_obs[:, aid, :],
+                        rnn_states_next[:, aid, :, :],
+                        rnn_states_critic_next[:, aid, :, :],
+                        actions_by_agent[aid],
+                        action_log_probs_by_agent[aid],
+                        values_by_agent[aid],
+                        rewards[:, aid, :],
+                        masks_next[:, aid, :],
+                        active_masks=active_masks_next[:, aid, :],
+                    )
 
                 obs = next_obs
                 share_obs = share_obs_next
@@ -780,19 +937,37 @@ def main():
 
             rollout_dt = time.perf_counter() - rollout_t0
 
-            trainer.prep_rollout()
-            with torch.no_grad():
-                next_values_t = policy.get_values(
-                    buffer.share_obs[-1].reshape(-1, buffer.share_obs.shape[-1]),
-                    buffer.rnn_states_critic[-1].reshape(-1, args.recurrent_N, args.hidden_size),
-                    buffer.masks[-1].reshape(-1, 1),
-                )
-            next_values = _t2n(next_values_t).reshape(args.n_rollout_threads, num_agents, -1).astype(np.float32)
-            buffer.compute_returns(next_values, trainer.value_normalizer)
+            for trainer in trainers:
+                trainer.prep_rollout()
+            for aid, (policy, trainer, buffer) in enumerate(zip(policies, trainers, buffers)):
+                with torch.no_grad():
+                    next_values_t = policy.get_values(
+                        buffer.share_obs[-1],
+                        buffer.rnn_states_critic[-1],
+                        buffer.masks[-1],
+                    )
+                next_values = _t2n(next_values_t).astype(np.float32)
+                buffer.compute_returns(next_values, trainer.value_normalizer)
 
-            trainer.prep_training()
-            train_info = trainer.train(buffer)
-            buffer.after_update()
+            train_infos = []
+            for aid, (trainer, buffer) in enumerate(zip(trainers, buffers)):
+                trainer.prep_training()
+                train_info_i = trainer.train(buffer)
+                buffer.after_update()
+                train_infos.append(train_info_i)
+
+            metric_keys = [
+                "value_loss",
+                "policy_loss",
+                "dist_entropy",
+                "actor_grad_norm",
+                "critic_grad_norm",
+                "ratio",
+            ]
+            train_info = {}
+            for key in metric_keys:
+                vals = [_to_scalar(info.get(key, 0.0)) for info in train_infos]
+                train_info[key] = float(np.mean(vals)) if len(vals) > 0 else 0.0
 
             policy_update_idx += 1
             episodes_done += int(args.n_rollout_threads)
@@ -832,12 +1007,15 @@ def main():
 
             if args.save_interval_episodes > 0 and episodes_done % args.save_interval_episodes == 0:
                 ckpt_prefix = str(checkpoint_dir / f"mappo_seed{args.seed}_run{run_timestamp}_ep{episodes_done}")
-                actor_path, critic_path = _save_checkpoint(policy, ckpt_prefix)
-                print(f"Checkpoint saved: actor={actor_path}, critic={critic_path}")
+                actor_paths, critic_paths = _save_checkpoint(policies, ckpt_prefix)
+                print(
+                    f"Checkpoint saved: actors={len(actor_paths)}, critics={len(critic_paths)}, "
+                    f"actor0={actor_paths[0]}, critic0={critic_paths[0]}"
+                )
 
             episodes_for_schedule = int(min(episodes_done, total_episodes_target))
             while episodes_for_schedule >= next_eval_episode:
-                eval_metrics = evaluate_with_runner_strategy(env, policy, args)
+                eval_metrics = evaluate_with_runner_strategy(env, policies, args)
                 eval_ep_mark = int(next_eval_episode)
                 eval_metrics["eval/episode"] = eval_ep_mark
 
@@ -849,6 +1027,8 @@ def main():
                     f"solved_ratio={eval_metrics['eval/solved_ratio']:.4f}, "
                     f"seed_range=[{int(eval_metrics['eval/seed_start'])}, {int(eval_metrics['eval/seed_end'])}]"
                 )
+                print(f"eval/true_reward={eval_metrics['eval/true_reward']:.6f}")
+                _append_jsonl(eval_metrics_path, eval_metrics)
 
                 if np.isfinite(eval_metrics["eval/true_reward"]) and eval_metrics["eval/true_reward"] > best_eval_reward:
                     best_eval_reward = float(eval_metrics["eval/true_reward"])
@@ -856,11 +1036,11 @@ def main():
                         checkpoint_dir
                         / f"best_mappo_seed{args.seed}_run{run_timestamp}_env{env.name.replace('/', '-')}_ep{eval_ep_mark}"
                     )
-                    actor_path, critic_path = _save_checkpoint(policy, best_prefix)
-                    best_ckpt = (actor_path, critic_path)
+                    actor_paths, critic_paths = _save_checkpoint(policies, best_prefix)
+                    best_ckpt = (actor_paths, critic_paths)
                     print(
                         f"[best-checkpoint] updated: reward={best_eval_reward:.6f}, "
-                        f"actor={actor_path}, critic={critic_path}"
+                        f"actor0={actor_paths[0]}, critic0={critic_paths[0]}"
                     )
 
                 _wandb_log(wandb_run, eval_metrics)
@@ -884,8 +1064,10 @@ def main():
     print("Training finished.")
     print(f"episodes_done={episodes_done}, total_env_steps={total_env_steps}, best_eval_true_reward={best_eval_reward:.6f}")
     if best_ckpt is not None:
-        print(f"best_actor={best_ckpt[0]}")
-        print(f"best_critic={best_ckpt[1]}")
+        for path in best_ckpt[0]:
+            print(f"best_actor={path}")
+        for path in best_ckpt[1]:
+            print(f"best_critic={path}")
 
 
 if __name__ == "__main__":

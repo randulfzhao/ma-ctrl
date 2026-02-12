@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import imageio.v2 as imageio
 import numpy as np
@@ -25,13 +25,14 @@ except Exception:
 
 from onpolicy.algorithms.r_mappo.algorithm.rMAPPOPolicy import R_MAPPOPolicy
 from runner_coop_ma_enode import MAMUJOCO_ENV_SPECS, MaMuJoCoEnv
-from runner_mappo import FIXED_EPISODE_SECONDS, _build_policy_inference_fn, evaluate_with_runner_strategy
+from runner_mappo import FIXED_EPISODE_SECONDS, _build_policy_inference_fn
 
 
 DEFAULT_ENVS = "swimmer,cheetah6x1,ant2x4,ant2x4d,ant4x2,walker"
 CKPT_ACTOR_RE = re.compile(
-    r"^best_mappo_seed(?P<seed>\d+)_run(?P<run_ts>\d{8}_\d{6})_env(?P<env_name>.+)_ep(?P<episode>\d+)_actor\.pt$"
+    r"^best_mappo_seed(?P<seed>\d+)_run(?P<run_ts>\d{8}_\d{6})_env(?P<env_name>.+)_ep(?P<episode>\d+)(?:_agent(?P<agent_id>\d+))?_actor\.pt$"
 )
+AGENT_ACTOR_RE = re.compile(r"^(?P<prefix>.+)_agent(?P<agent_id>\d+)_actor\.pt$")
 
 
 @dataclass(frozen=True)
@@ -48,8 +49,8 @@ class CandidateCheckpoint:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Visualize one best MAPPO policy per MaMuJoCo environment. "
-            "Best is selected by re-evaluating discovered best_mappo checkpoints."
+            "Visualize policy rollouts for latest MAPPO runs on MaMuJoCo "
+            "environments and save videos to vid/mappo."
         )
     )
     p.add_argument(
@@ -67,19 +68,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--agent-obsk", type=int, default=1)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--algorithm-name", type=str, default="mappo", choices=["mappo", "rmappo"])
-    p.add_argument(
-        "--eval-seed-base",
-        type=int,
-        default=111,
-        help="Evaluation uses fixed seeds [base, base+9] for all candidates.",
-    )
-    p.add_argument("--eval-env-workers", type=int, default=4)
-    p.add_argument(
-        "--max-candidates-per-env",
-        type=int,
-        default=0,
-        help="0 means evaluate all candidates; >0 limits to the most recent N per env.",
-    )
     p.add_argument(
         "--mujoco-gl",
         type=str,
@@ -181,13 +169,47 @@ def make_policy_args(algorithm_name: str) -> SimpleNamespace:
     )
 
 
+def _build_act_spaces(env: MaMuJoCoEnv) -> List[Box]:
+    act_dims = [int(d) for d in env.act_dims]
+    act_spaces: List[Box] = []
+    for aid, act_dim in enumerate(act_dims):
+        low = np.asarray(env.agent_action_lows[aid], dtype=np.float32).reshape(-1)
+        high = np.asarray(env.agent_action_highs[aid], dtype=np.float32).reshape(-1)
+        if low.shape[0] != act_dim or high.shape[0] != act_dim:
+            raise RuntimeError(
+                f"Action bound shape mismatch for agent {aid}: "
+                f"low={low.shape}, high={high.shape}, act_dim={act_dim}"
+            )
+        act_spaces.append(Box(low=low, high=high, shape=(act_dim,), dtype=np.float32))
+    return act_spaces
+
+
+def _resolve_agent_checkpoint_group(actor_path: Path) -> Optional[Dict[int, Tuple[Path, Path]]]:
+    m = AGENT_ACTOR_RE.match(actor_path.name)
+    if m is None:
+        return None
+    prefix = str(m.group("prefix"))
+    grouped: Dict[int, Tuple[Path, Path]] = {}
+    for ap in actor_path.parent.glob(f"{prefix}_agent*_actor.pt"):
+        mi = AGENT_ACTOR_RE.match(ap.name)
+        if mi is None:
+            continue
+        aid = int(mi.group("agent_id"))
+        cp = ap.with_name(ap.name.replace("_actor.pt", "_critic.pt"))
+        if cp.is_file():
+            grouped[aid] = (ap, cp)
+    if len(grouped) == 0:
+        return None
+    return grouped
+
+
 def build_policy_from_checkpoint(
     candidate: CandidateCheckpoint,
     dt: float,
     agent_obsk: int,
     device: torch.device,
     algorithm_name: str,
-) -> Tuple[R_MAPPOPolicy, MaMuJoCoEnv, SimpleNamespace]:
+) -> Tuple[Union[R_MAPPOPolicy, List[R_MAPPOPolicy]], MaMuJoCoEnv, SimpleNamespace]:
     scenario, agent_conf = MAMUJOCO_ENV_SPECS[candidate.env_alias]
     env = MaMuJoCoEnv(
         scenario=scenario,
@@ -202,23 +224,47 @@ def build_policy_from_checkpoint(
         agent_obsk=int(agent_obsk),
     )
 
+    obs_dim = int(env.obs_dim)
+    obs_space = Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+    share_obs_space = Box(low=-np.inf, high=np.inf, shape=(int(env.n),), dtype=np.float32)
+    act_spaces = _build_act_spaces(env)
     act_dims = [int(d) for d in env.act_dims]
+
+    policy_args = make_policy_args(algorithm_name=algorithm_name)
+    agent_ckpts = _resolve_agent_checkpoint_group(candidate.actor_path)
+    if agent_ckpts is not None:
+        expected_ids = list(range(int(env.n_agents)))
+        found_ids = sorted(agent_ckpts.keys())
+        if found_ids != expected_ids:
+            raise ValueError(
+                f"Per-agent checkpoint set mismatch for env={candidate.env_alias}: "
+                f"expected_agent_ids={expected_ids}, found_agent_ids={found_ids}, "
+                f"actor_hint={candidate.actor_path}"
+            )
+
+        policies: List[R_MAPPOPolicy] = []
+        for aid in expected_ids:
+            actor_path, critic_path = agent_ckpts[aid]
+            policy_i = R_MAPPOPolicy(policy_args, obs_space, share_obs_space, act_spaces[aid], device=device)
+            try:
+                actor_sd = torch.load(actor_path, map_location=device, weights_only=True)
+                critic_sd = torch.load(critic_path, map_location=device, weights_only=True)
+            except TypeError:
+                actor_sd = torch.load(actor_path, map_location=device)
+                critic_sd = torch.load(critic_path, map_location=device)
+            policy_i.actor.load_state_dict(actor_sd)
+            policy_i.critic.load_state_dict(critic_sd)
+            policy_i.actor.eval()
+            policy_i.critic.eval()
+            policies.append(policy_i)
+        return policies, env, policy_args
+
     if len(set(act_dims)) != 1:
         raise ValueError(
             f"MAPPO shared policy requires homogeneous action dims, got {act_dims} for env={candidate.env_alias}"
         )
-    act_dim = int(act_dims[0])
-    obs_dim = int(env.obs_dim)
-    low = np.asarray(env.agent_action_lows[0], dtype=np.float32).reshape(-1)
-    high = np.asarray(env.agent_action_highs[0], dtype=np.float32).reshape(-1)
 
-    obs_space = Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
-    share_obs_space = Box(low=-np.inf, high=np.inf, shape=(int(env.n),), dtype=np.float32)
-    act_space = Box(low=low, high=high, shape=(act_dim,), dtype=np.float32)
-
-    policy_args = make_policy_args(algorithm_name=algorithm_name)
-    policy = R_MAPPOPolicy(policy_args, obs_space, share_obs_space, act_space, device=device)
-
+    policy = R_MAPPOPolicy(policy_args, obs_space, share_obs_space, act_spaces[0], device=device)
     try:
         actor_sd = torch.load(candidate.actor_path, map_location=device, weights_only=True)
         critic_sd = torch.load(candidate.critic_path, map_location=device, weights_only=True)
@@ -264,7 +310,9 @@ def discover_candidate_checkpoints(
         )
         key = (env_alias, seed, run_ts)
         prev = grouped.get(key, None)
-        if prev is None or cand.episode > prev.episode:
+        if (prev is None) or (cand.episode > prev.episode) or (
+            cand.episode == prev.episode and cand.actor_path.name < prev.actor_path.name
+        ):
             grouped[key] = cand
 
     by_env: Dict[str, List[CandidateCheckpoint]] = {alias: [] for alias in env_aliases}
@@ -275,113 +323,31 @@ def discover_candidate_checkpoints(
     return by_env
 
 
-def evaluate_candidate(
-    candidate: CandidateCheckpoint,
-    dt: float,
-    agent_obsk: int,
-    device: torch.device,
-    algorithm_name: str,
-    eval_seed_base: int,
-    eval_env_workers: int,
-) -> Dict[str, float]:
-    policy, env, policy_args = build_policy_from_checkpoint(
-        candidate=candidate,
-        dt=dt,
-        agent_obsk=agent_obsk,
-        device=device,
-        algorithm_name=algorithm_name,
-    )
-    eval_args = SimpleNamespace(
-        algorithm_name=str(algorithm_name),
-        eval_env_workers=int(eval_env_workers),
-        seed=int(eval_seed_base),
-        recurrent_N=int(policy_args.recurrent_N),
-        hidden_size=int(policy_args.hidden_size),
-        use_recurrent_policy=bool(policy_args.use_recurrent_policy),
-        use_naive_recurrent_policy=bool(policy_args.use_naive_recurrent_policy),
-    )
-    metrics = evaluate_with_runner_strategy(env, policy, eval_args)
-    return {k: float(v) if isinstance(v, (int, float, np.generic)) else v for k, v in metrics.items()}
-
-
-def select_best_candidates(
+def resolve_latest_runs(
     by_env: Dict[str, List[CandidateCheckpoint]],
     env_aliases: List[str],
-    dt: float,
-    agent_obsk: int,
-    device: torch.device,
-    algorithm_name: str,
-    eval_seed_base: int,
-    eval_env_workers: int,
-    max_candidates_per_env: int,
-) -> Dict[str, Dict[str, object]]:
-    selected: Dict[str, Dict[str, object]] = {}
+) -> List[Dict[str, object]]:
+    run_infos: List[Dict[str, object]] = []
     for env_alias in env_aliases:
         candidates = list(by_env.get(env_alias, []))
         if len(candidates) == 0:
             print(f"[warn] env={env_alias}: no candidate checkpoints found.")
             continue
-        if int(max_candidates_per_env) > 0:
-            candidates = candidates[: int(max_candidates_per_env)]
 
-        best: Optional[Dict[str, object]] = None
-        print(f"[select] env={env_alias}: evaluating {len(candidates)} candidate(s)")
-        for idx, cand in enumerate(candidates, start=1):
-            try:
-                metrics = evaluate_candidate(
-                    candidate=cand,
-                    dt=dt,
-                    agent_obsk=agent_obsk,
-                    device=device,
-                    algorithm_name=algorithm_name,
-                    eval_seed_base=eval_seed_base,
-                    eval_env_workers=eval_env_workers,
-                )
-            except Exception as e:
-                print(
-                    f"[warn] env={env_alias} candidate {idx}/{len(candidates)} "
-                    f"(seed={cand.seed}, run={cand.run_ts}, ep={cand.episode}) failed: {e}"
-                )
-                continue
-
-            score = float(metrics.get("eval/true_reward", -np.inf))
-            print(
-                f"[eval] env={env_alias} cand={idx}/{len(candidates)} "
-                f"seed={cand.seed} run={cand.run_ts} ep={cand.episode} "
-                f"true_reward={score:.4f}"
-            )
-
-            cand_pack = {
-                "candidate": cand,
-                "metrics": metrics,
+        cand = candidates[0]
+        run_infos.append(
+            {
+                "run_name": f"{env_alias}-mappo-seed{cand.seed}-{cand.run_ts}",
+                "env_alias": env_alias,
+                "seed": int(cand.seed),
+                "actor_path": str(cand.actor_path),
+                "critic_path": str(cand.critic_path),
+                "model_source": "best_checkpoint_latest_run",
+                "run_ts": cand.run_ts,
+                "episode": int(cand.episode),
             }
-            if best is None:
-                best = cand_pack
-            else:
-                best_score = float(best["metrics"].get("eval/true_reward", -np.inf))
-                if (score > best_score) or (
-                    np.isclose(score, best_score)
-                    and (cand.run_ts, cand.episode, cand.seed)
-                    > (
-                        best["candidate"].run_ts,
-                        int(best["candidate"].episode),
-                        int(best["candidate"].seed),
-                    )
-                ):
-                    best = cand_pack
-
-        if best is None:
-            print(f"[warn] env={env_alias}: all candidates failed during evaluation.")
-            continue
-
-        selected[env_alias] = best
-        best_cand = best["candidate"]
-        best_score = float(best["metrics"]["eval/true_reward"])
-        print(
-            f"[best] env={env_alias} seed={best_cand.seed} run={best_cand.run_ts} "
-            f"ep={best_cand.episode} true_reward={best_score:.4f}"
         )
-    return selected
+    return run_infos
 
 
 def make_render_env(scenario: str, agent_conf: str, agent_obsk: int):
@@ -499,6 +465,7 @@ def rollout_job_worker(
     env_alias: str,
     actor_path: str,
     critic_path: str,
+    model_source: str,
     seed: int,
     ep: int,
     out_dir: str,
@@ -551,6 +518,7 @@ def rollout_job_worker(
                 mujoco_gl=np.asarray(chosen_gl),
                 actor_path=np.asarray(actor_path),
                 critic_path=np.asarray(critic_path),
+                model_source=np.asarray(model_source),
             )
             saved_npz = str(npz_path)
 
@@ -560,10 +528,11 @@ def rollout_job_worker(
                 "video_path": str(actual_path),
                 "npz_path": saved_npz,
                 "gl_backend": chosen_gl,
+                "model_source": model_source,
             }
         )
     except Exception as e:
-        queue.put({"ok": False, "error": str(e), "gl_backend": gl_backend})
+        queue.put({"ok": False, "error": str(e), "gl_backend": gl_backend, "model_source": model_source})
 
 
 def run_rollout_job_in_subprocess(
@@ -571,6 +540,7 @@ def run_rollout_job_in_subprocess(
     env_alias: str,
     actor_path: str,
     critic_path: str,
+    model_source: str,
     seed: int,
     ep: int,
     out_dir: Path,
@@ -594,6 +564,7 @@ def run_rollout_job_in_subprocess(
             env_alias,
             actor_path,
             critic_path,
+            model_source,
             int(seed),
             int(ep),
             str(out_dir),
@@ -653,58 +624,40 @@ def main() -> None:
     checkpoint_dir = Path(args.checkpoint_dir)
     out_dir = resolve_output_dir(args.output_dir)
     gl_candidates = candidate_gl_backends(args.mujoco_gl)
-    eval_device = torch.device(args.device)
 
     by_env = discover_candidate_checkpoints(checkpoint_dir=checkpoint_dir, env_aliases=env_aliases)
-    for env_alias in env_aliases:
-        print(f"[discover] env={env_alias} candidates={len(by_env.get(env_alias, []))}")
-
-    selected = select_best_candidates(
-        by_env=by_env,
-        env_aliases=env_aliases,
-        dt=float(args.dt),
-        agent_obsk=int(args.agent_obsk),
-        device=eval_device,
-        algorithm_name=str(args.algorithm_name),
-        eval_seed_base=int(args.eval_seed_base),
-        eval_env_workers=int(args.eval_env_workers),
-        max_candidates_per_env=int(args.max_candidates_per_env),
-    )
-
-    if len(selected) == 0:
-        raise SystemExit("No best checkpoints selected; nothing to visualize.")
+    run_infos = resolve_latest_runs(by_env=by_env, env_aliases=env_aliases)
+    if len(run_infos) == 0:
+        raise SystemExit("No latest MAPPO checkpoints found; nothing to visualize.")
 
     print(
-        f"Recording best MAPPO videos: envs={len(selected)}, episodes_per_env={int(args.episodes)}, "
-        f"H={float(args.horizon_sec)}, dt={float(args.dt)}, fps={int(args.fps)}, "
-        f"MUJOCO_GL_candidates={gl_candidates}, out={out_dir}"
+        f"Recording policy videos: runs={len(run_infos)}, H={float(args.horizon_sec)}, dt={float(args.dt)}, "
+        f"fps={int(args.fps)}, MUJOCO_GL_candidates={gl_candidates}, out={out_dir}"
     )
+    for item in run_infos:
+        print(
+            f"[map] run={item['run_name']} env={item['env_alias']} seed={item['seed']} "
+            f"source={item['model_source']} actor={item['actor_path']}"
+        )
 
     total = 0
-    for env_alias in env_aliases:
-        sel = selected.get(env_alias, None)
-        if sel is None:
-            continue
-        cand: CandidateCheckpoint = sel["candidate"]
-        score = float(sel["metrics"]["eval/true_reward"])
-        run_name = (
-            f"{env_alias}-mappo-best-seed{cand.seed}-run{cand.run_ts}"
-            f"-ep{cand.episode}-score{score:.3f}"
-        )
-        print(
-            f"[map] env={env_alias} run={cand.run_ts} seed={cand.seed} ep={cand.episode} "
-            f"score={score:.4f} actor={cand.actor_path}"
-        )
-
+    for item in run_infos:
+        run_name = str(item["run_name"])
+        env_alias = str(item["env_alias"])
+        seed_base = int(item["seed"])
+        actor_path = str(item["actor_path"])
+        critic_path = str(item["critic_path"])
+        model_source = str(item["model_source"])
         for ep in range(int(args.episodes)):
-            viz_seed = int(cand.seed) + ep
+            viz_seed = seed_base + ep
             success = False
             for gl_backend in gl_candidates:
                 res = run_rollout_job_in_subprocess(
                     run_name=run_name,
                     env_alias=env_alias,
-                    actor_path=str(cand.actor_path),
-                    critic_path=str(cand.critic_path),
+                    actor_path=actor_path,
+                    critic_path=critic_path,
+                    model_source=model_source,
                     seed=viz_seed,
                     ep=ep,
                     out_dir=out_dir,
@@ -721,23 +674,25 @@ def main() -> None:
                 if bool(res.get("ok", False)):
                     if args.save_actions and str(res.get("npz_path", "")):
                         print(
-                            f"[ok] env={env_alias} ep={ep} seed={viz_seed} gl={res.get('gl_backend')} "
+                            f"[ok] run={run_name} ep={ep} gl={res.get('gl_backend')} "
+                            f"source={res.get('model_source')} "
                             f"saved: {res.get('video_path')} and {res.get('npz_path')}"
                         )
                     else:
                         print(
-                            f"[ok] env={env_alias} ep={ep} seed={viz_seed} gl={res.get('gl_backend')} "
+                            f"[ok] run={run_name} ep={ep} gl={res.get('gl_backend')} "
+                            f"source={res.get('model_source')} "
                             f"saved: {res.get('video_path')}"
                         )
                     total += 1
                     success = True
                     break
                 print(
-                    f"[warn] env={env_alias} ep={ep} seed={viz_seed} gl={gl_backend} failed: "
+                    f"[warn] run={run_name} ep={ep} gl={gl_backend} failed: "
                     f"{res.get('error', 'unknown error')}"
                 )
             if not success:
-                print(f"[warn] env={env_alias} ep={ep} seed={viz_seed} failed on all backends: {gl_candidates}")
+                print(f"[warn] run={run_name} ep={ep} failed on all backends: {gl_candidates}")
 
     if total == 0:
         raise SystemExit("No videos generated.")

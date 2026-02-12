@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 GPU_ID=7
+SEEDS=(113 114)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
@@ -20,22 +21,22 @@ for SEED in "${SEEDS[@]}"; do
     --consensus_weight 0.02 \
     --device "cuda:${GPU_ID}" \
     --episode_length 50 \
-    --replay_buffer_size 20 \
-    --dyn_max_episodes 20 \
+    --replay_buffer_size 100 \
+    --dyn_max_episodes 100 \
     --discount_rho 0.95 \
     --soft_update_tau 0.001 \
     --actor_lr 0.0001 \
     --critic_lr 0.001 \
-    --dyn_lr 0.001 \
-    --dyn_grad_clip 10.0 \
-    --dyn_batch_size 128 \
-    --dyn_update_steps 200 \
-    --dyn_window_steps 5 \
+    --dyn_lr 0.0003 \
+    --dyn_grad_clip 3.0 \
+    --dyn_batch_size 512 \
+    --dyn_update_steps 100 \
+    --dyn_window_steps 8 \
     --rew_lr 0.001 \
     --policy_batch_size 256 \
     --critic_updates 4 \
     --exploration_steps 1000 \
-    --new_episodes_per_round 10 \
+    --new_episodes_per_round 4 \
     --dyn_nrep 10 \
     --collect_parallel_workers 10 \
     --torch_num_threads 1 \
@@ -43,11 +44,11 @@ for SEED in "${SEEDS[@]}"; do
     --model_save_interval 1000 \
     --seed "${SEED}" \
     --use_wandb \
-    --wandb_project ma-ctrl \
+    --wandb_project "enode parameter tuning" \
     --wandb_group cheetah6x1-enode \
     --wandb_name "cheetah6x1-enode-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
     --wandb_mode online \
-    --wandb_tags enode,cheetah6x1 \
+    --wandb_tags "enode,cheetah6x1,dt0.05,dynlr3e-4,dynclip3,dynbs512,dynsteps100,dynwin8,rb100,dynmax100,neweps4,nens5" \
     --wandb_entity "" \
     2>&1 | tee "logs/cheetah6x1_enode_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
 done

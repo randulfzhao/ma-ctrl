@@ -13,7 +13,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 
-from runner_coop_ma_enode import (
+from runner_enode import (
     MAMUJOCO_ENV_SPECS,
     MaMuJoCoEnv,
     build_ctde_multi_controller_policy,

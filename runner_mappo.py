@@ -26,7 +26,7 @@ from onpolicy.algorithms.r_mappo.algorithm.rMAPPOPolicy import R_MAPPOPolicy
 from onpolicy.algorithms.r_mappo.r_mappo import R_MAPPO
 from onpolicy.utils.separated_buffer import SeparatedReplayBuffer
 
-from runner_coop_ma_enode import (
+from runner_enode import (
     FIXED_EPISODE_SECONDS,
     MAMUJOCO_ENV_SPECS,
     MPE_ENV_ALIASES,
@@ -115,7 +115,7 @@ def _tensor_stats(prefix: str, tensor: torch.Tensor) -> Dict[str, float]:
 
 
 class MAPPOEpisodeWorker:
-    """Single runtime environment worker built on runner_coop_ma_enode adapters."""
+    """Single runtime environment worker built on runner_enode adapters."""
 
     def __init__(self, env, env_kind: str, worker_id: int = 0):
         self.env = env

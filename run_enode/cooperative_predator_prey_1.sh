@@ -9,7 +9,7 @@ RUN_TS="$(date +%Y%m%d_%H%M%S)"
 mkdir -p logs
 
 for SEED in "${SEEDS[@]}"; do
-  python runner_coop_ma_enode.py \
+  python runner_enode.py \
     --env cooperative_predator_prey \
     --rounds 100 \
     --dt 0.1 \

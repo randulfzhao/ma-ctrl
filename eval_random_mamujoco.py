@@ -11,7 +11,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import torch
 
-from runner_coop_ma_enode import FIXED_EPISODE_SECONDS, MAMUJOCO_ENV_SPECS, MaMuJoCoEnv
+from runner_enode import FIXED_EPISODE_SECONDS, MAMUJOCO_ENV_SPECS, MaMuJoCoEnv
 from utils.utils import numpy_to_torch
 
 
@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Evaluate uniform random policy on MaMuJoCo envs used by run_enode_mujoco.sh "
-            "with the same reward aggregation strategy as runner_coop_ma_enode.py"
+            "with the same reward aggregation strategy as runner_enode.py"
         )
     )
     p.add_argument("--run-script", type=str, default="run_enode_mujoco.sh")

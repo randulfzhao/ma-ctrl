@@ -24,7 +24,7 @@ except Exception:
     from gym.spaces import Box
 
 from onpolicy.algorithms.r_mappo.algorithm.rMAPPOPolicy import R_MAPPOPolicy
-from runner_coop_ma_enode import MAMUJOCO_ENV_SPECS, MaMuJoCoEnv
+from runner_enode import MAMUJOCO_ENV_SPECS, MaMuJoCoEnv
 from runner_mappo import FIXED_EPISODE_SECONDS, _build_policy_inference_fn
 
 

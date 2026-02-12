@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple
 import imageio.v2 as imageio
 import numpy as np
 
-from runner_coop_ma_enode import MAMUJOCO_ENV_SPECS
+from runner_enode import MAMUJOCO_ENV_SPECS
 
 
 H_TEST_SEC = 2.5

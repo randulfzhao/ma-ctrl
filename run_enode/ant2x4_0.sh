@@ -30,7 +30,7 @@ for SEED in "${SEEDS[@]}"; do
     --dyn_lr 0.001 \
     --dyn_grad_clip 3.0 \
     --dyn_batch_size 256 \
-    --dyn_update_steps 100 \
+    --dyn_update_steps 200 \
     --dyn_window_steps 8 \
     --rew_lr 0.001 \
     --policy_batch_size 256 \
@@ -48,7 +48,7 @@ for SEED in "${SEEDS[@]}"; do
     --wandb_group ant2x4-enode \
     --wandb_name "ant2x4-enode-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
     --wandb_mode online \
-    --wandb_tags "enode,ant2x4,dt0.05,dynlr3e-4,dynclip3,dynbs512,dynsteps100,dynwin8,rb100,dynmax100,neweps4,nens5" \
+    --wandb_tags "enode,ant2x4,dt0.05,dynlr3e-4,dynclip3,dynbs512,dynsteps200,dynwin8,rb100,dynmax100,neweps4,nens5" \
     --wandb_entity "" \
     2>&1 | tee "logs/ant2x4_enode_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
 done

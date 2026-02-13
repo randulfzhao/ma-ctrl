@@ -21,15 +21,15 @@ for SEED in "${SEEDS[@]}"; do
     --consensus_weight 0.02 \
     --device "cuda:${GPU_ID}" \
     --episode_length 25 \
-    --replay_buffer_size 100 \
+    --replay_buffer_size 50 \
     --dyn_max_episodes 100 \
     --discount_rho 0.95 \
     --soft_update_tau 0.001 \
     --actor_lr 0.0001 \
     --critic_lr 0.001 \
-    --dyn_lr 0.0003 \
+    --dyn_lr 0.001 \
     --dyn_grad_clip 3.0 \
-    --dyn_batch_size 512 \
+    --dyn_batch_size 256 \
     --dyn_update_steps 100 \
     --dyn_window_steps 8 \
     --rew_lr 0.001 \

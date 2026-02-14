@@ -7,26 +7,33 @@ GPU_ID=6
 SEEDS=(111 112)
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 mkdir -p logs
-# ENODE parity notes (not consumed by runner_mappo.py):
-# replay_buffer_size=104, soft_update_tau=0.001
-# dyn_lr=0.001, rew_lr=0.001, exploration_steps=1000
-
+# ENODE parity settings used below:
+# rounds=100, exploration_steps=1000, new_episodes_per_round=4
+ENODE_ROUNDS=100
+ENODE_EXPLORATION_STEPS=1000
+ENODE_NEW_EPISODES_PER_ROUND=4
+EPISODE_LENGTH=50
+DT=0.05
+ROLLOUT_THREADS=10
+EVAL_INTERVAL_EPISODES=${ENODE_NEW_EPISODES_PER_ROUND}
+ENODE_INIT_EPISODES=$(( (ENODE_EXPLORATION_STEPS + EPISODE_LENGTH - 1) / EPISODE_LENGTH ))
+ENODE_TOTAL_EPISODES=$(( ENODE_INIT_EPISODES + ENODE_ROUNDS * ENODE_NEW_EPISODES_PER_ROUND ))
 
 for SEED in "${SEEDS[@]}"; do
   CUDA_VISIBLE_DEVICES="${GPU_ID}" python runner_mappo.py \
     --env cheetah6x1 \
     --algorithm_name mappo \
-    --episodes 10000 \
-    --episode_length 50 \
-    --dt 0.05 \
+    --episodes "${ENODE_TOTAL_EPISODES}" \
+    --episode_length "${EPISODE_LENGTH}" \
+    --dt "${DT}" \
     --solver rk4 \
     --consensus_weight 0.02 \
     --device "cuda:0" \
-    --n_rollout_threads 16 \
-    --env_step_workers 16 \
-    --collect_parallel_workers 10 \
-    --eval_every_episodes 200 \
-    --eval_episodes 32 \
+    --n_rollout_threads "${ROLLOUT_THREADS}" \
+    --env_step_workers "${ROLLOUT_THREADS}" \
+    --collect_parallel_workers "${ROLLOUT_THREADS}" \
+    --eval_every_episodes "${EVAL_INTERVAL_EPISODES}" \
+    --eval_episodes 10 \
     --eval_env_workers 8 \
     --num_mini_batch 4 \
     --ppo_epoch 10 \

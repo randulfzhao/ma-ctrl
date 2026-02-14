@@ -37,18 +37,22 @@ for SEED in "${SEEDS[@]}"; do
     --eval_env_workers 8 \
     --num_mini_batch 4 \
     --ppo_epoch 10 \
-    --lr 0.0001 \
-    --critic_lr 0.001 \
-    --gamma 0.95 \
+    --hidden_size 32 \
+    --lr 0.00005 \
+    --critic_lr 0.0005 \
+    --clip_param 0.1 \
+    --entropy_coef 0.03 \
+    --gamma 0.90 \
+    --use_linear_lr_decay \
     --n_training_threads 1 \
     --save_interval_episodes 1000 \
     --seed "${SEED}" \
     --use_wandb \
-    --wandb_project ma-ctrl \
+    --wandb_project "mappo tuning" \
     --wandb_group walker-mappo \
     --wandb_name "walker-mappo-gpu${GPU_ID}-seed${SEED}-${RUN_TS}" \
     --wandb_mode online \
-    --wandb_tags mappo,walker \
+    --wandb_tags mappo,walker,mappo_tuning,weaker_policy \
     --wandb_entity "" \
     2>&1 | tee "logs/walker_mappo_gpu${GPU_ID}_seed${SEED}_${RUN_TS}.log"
 done
